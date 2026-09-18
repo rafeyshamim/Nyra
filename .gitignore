@@ -1,0 +1,13 @@
+.env
+*.db
+data/
+logs/
+recordings/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+venv/
+.venv/
+dist/
+build/
