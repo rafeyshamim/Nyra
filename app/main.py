@@ -6,9 +6,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config.settings import settings
 from app.config.logging import setup_logging
 from app.database.session import init_db
+from fastapi.responses import HTMLResponse
+from pathlib import Path
+
 from app.api.routes_health import router as health_router
 from app.api.routes_whatsapp import router as whatsapp_router
 from app.api.routes_telephony import router as telephony_router
+from app.api.routes_dashboard import router as dashboard_router
 
 
 @asynccontextmanager
@@ -47,3 +51,13 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(whatsapp_router)
 app.include_router(telephony_router)
+app.include_router(dashboard_router)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    """Serve local web dashboard HTML interface."""
+    html_file = Path(__file__).resolve().parent.parent / "dashboard" / "templates" / "index.html"
+    if html_file.exists():
+        return html_file.read_text(encoding="utf-8")
+    return "<h1>Nyra Dashboard</h1>"
