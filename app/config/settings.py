@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     exotel_api_key: str = ""
     exotel_api_token: str = ""
     exotel_virtual_number: str = ""
+    exotel_media_encoding: str = "audio/pcm"
+    exotel_media_sample_rate: int = 16000
     telephony_webhook_token: str = ""
 
     # WhatsApp Provider (mock | cloud_api)
