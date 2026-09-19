@@ -82,3 +82,18 @@ def test_call_status_webhook():
     assert data["status"] == "accepted"
     assert data["call_id"] == "exotel_call_1001"
     assert data["event"] == "completed"
+
+
+def test_webhook_token_authentication(monkeypatch):
+    from app.config.settings import settings
+    monkeypatch.setattr(settings, "telephony_webhook_token", "secret_token_123")
+
+    payload = {"CallSid": "auth_call_1", "From": "+919800000000"}
+
+    # Unauthorized request (no token)
+    res_unauth = client.post("/call/incoming", json=payload)
+    assert res_unauth.status_code == 401
+
+    # Authorized request with header token
+    res_auth = client.post("/call/incoming", json=payload, headers={"X-Webhook-Token": "secret_token_123"})
+    assert res_auth.status_code == 200

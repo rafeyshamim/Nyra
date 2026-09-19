@@ -14,6 +14,7 @@ from app.postcall.analyzer import PostCallProcessor
 from app.telephony.exotel import ExotelAgentStreamProvider
 
 from typing import Dict, Any, Optional
+from fastapi import HTTPException, status
 from fastapi.responses import Response, JSONResponse
 from app.config.settings import settings
 from app.contacts.resolver import CallerResolver
@@ -50,6 +51,29 @@ async def finalize_call_session(call_id: str, db: AsyncSession, session: Optiona
             await postcall_processor.process_completed_call(db, session_to_process)
         except Exception as e:
             logger.error(f"Post-call processing error for call {call_id}: {e}")
+
+
+def verify_webhook_auth(request: Request, data: Dict[str, Any]):
+    """Verify telephony webhook token if TELEPHONY_WEBHOOK_TOKEN setting is configured."""
+    expected_token = settings.telephony_webhook_token
+    if not expected_token:
+        return
+
+    auth_header = request.headers.get("x-webhook-token") or request.headers.get("authorization", "")
+    token_param = data.get("token") or data.get("webhook_token")
+
+    provided_token = ""
+    if auth_header:
+        provided_token = auth_header.replace("Bearer ", "").strip()
+    elif token_param:
+        provided_token = str(token_param).strip()
+
+    if provided_token != expected_token:
+        logger.warning(f"Unauthorized telephony webhook request from {request.client.host if request.client else 'unknown'}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing webhook verification token",
+        )
 
 
 async def parse_incoming_request(request: Request) -> Dict[str, Any]:
@@ -112,6 +136,7 @@ def extract_call_id_and_number(data: Dict[str, Any]) -> tuple[str, str]:
 async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_db_session)):
     """Callback route for incoming call events from Exotel / telephony providers."""
     data = await parse_incoming_request(request)
+    verify_webhook_auth(request, data)
     call_id, phone_number = extract_call_id_and_number(data)
 
     logger.info(f"Incoming call callback received: call_id={call_id}, phone_number={phone_number}")
@@ -185,6 +210,7 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
 async def handle_telephony_event(request: Request, db: AsyncSession = Depends(get_db_session)):
     """Webhook for telephony status events (call-start, call-answer, call-end, failed-call)."""
     data = await parse_incoming_request(request)
+    verify_webhook_auth(request, data)
     call_id, phone_number = extract_call_id_and_number(data)
     event_type = (
         data.get("EventType")
