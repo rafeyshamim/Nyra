@@ -16,9 +16,11 @@ from app.telephony.exotel import ExotelAgentStreamProvider
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, status
 from fastapi.responses import Response, JSONResponse
+from sqlalchemy import select
 from app.config.settings import settings
 from app.contacts.resolver import CallerResolver
 from app.conversation.state import CallSession
+from app.database.models import Call
 
 logger = logging.getLogger("nyra.api.telephony")
 router = APIRouter(tags=["Telephony Webhooks & WebSockets"])
@@ -34,8 +36,34 @@ exotel_provider = ExotelAgentStreamProvider()
 active_calls: Dict[str, Dict[str, Any]] = {}
 
 
+async def get_or_create_call_record(db: AsyncSession, call_id: str, phone_number: str, status_str: str = "ringing") -> Call:
+    """Persist or retrieve call record in database for multi-worker durability."""
+    res = await db.execute(select(Call).where(Call.call_id == call_id))
+    call_rec = res.scalars().first() if hasattr(res, "scalars") else None
+    if not call_rec:
+        call_rec = Call(
+            call_id=call_id,
+            phone_number=phone_number,
+            status=status_str,
+        )
+        db.add(call_rec)
+        await db.commit()
+        await db.refresh(call_rec)
+    elif call_rec.status != status_str and status_str != "ringing":
+        call_rec.status = status_str
+        await db.commit()
+    return call_rec
+
+
 async def finalize_call_session(call_id: str, db: AsyncSession, session: Optional[CallSession] = None):
     """Ensure post-call processing is executed exactly once per call."""
+    # Check DB record status first
+    res = await db.execute(select(Call).where(Call.call_id == call_id))
+    call_rec = res.scalars().first() if hasattr(res, "scalars") else None
+    if call_rec and call_rec.status in ["completed", "analyzed"]:
+        logger.info(f"Call {call_id} already marked as completed in database. Skipping duplicate finalization.")
+        return
+
     call_entry = active_calls.get(call_id)
     if call_entry:
         if call_entry.get("processed"):
@@ -49,6 +77,9 @@ async def finalize_call_session(call_id: str, db: AsyncSession, session: Optiona
     if session_to_process:
         try:
             await postcall_processor.process_completed_call(db, session_to_process)
+            if call_rec:
+                call_rec.status = "completed"
+                await db.commit()
         except Exception as e:
             logger.error(f"Post-call processing error for call {call_id}: {e}")
 
@@ -152,7 +183,7 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
         caller_name=caller_name,
     )
 
-    # Store call session in registry
+    # Store call session in registry and SQLite DB
     active_calls[call_id] = {
         "call_id": call_id,
         "phone_number": phone_number,
@@ -160,6 +191,7 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
         "status": "ringing",
         "caller_ctx": caller_ctx,
     }
+    await get_or_create_call_record(db, call_id, phone_number, status_str="ringing")
 
     # Construct WebSocket URL for Exotel AgentStream connection
     base_url = settings.public_base_url.rstrip("/")
@@ -258,13 +290,16 @@ async def websocket_call_stream(
     await websocket.accept()
     logger.info(f"WebSocket connected for call_id={call_id}")
 
-    # Retrieve existing session from registry or create a new session
+    # Retrieve existing session from registry or DB fallback
     call_entry = active_calls.get(call_id)
     if call_entry and call_entry.get("session"):
         session = call_entry["session"]
     else:
-        # Fallback to resolver if session was not pre-registered via /call/incoming
-        caller_number = (call_entry.get("phone_number") if call_entry else "") or "Unknown"
+        # Check DB for pre-registered call record
+        res = await db.execute(select(Call).where(Call.call_id == call_id))
+        call_rec = res.scalars().first() if hasattr(res, "scalars") else None
+        caller_number = call_rec.phone_number if call_rec else "Unknown"
+
         caller_ctx = await CallerResolver.resolve_caller_context(db, caller_number) if caller_number != "Unknown" else {}
         session = conv_manager.create_session(
             call_id=call_id,
@@ -279,21 +314,28 @@ async def websocket_call_stream(
             "caller_ctx": caller_ctx,
         }
 
+    await get_or_create_call_record(db, call_id, session.phone_number, status_str="in-progress")
+
     if call_entry:
         call_entry["status"] = "in-progress"
-    greeting_text = conv_manager.get_initial_greeting(session)
 
-    # Synthesize and send initial greeting speech
-    greeting_audio = await tts_provider.synthesize_speech(greeting_text)
-    response_frame = exotel_provider.format_media_response(call_id, greeting_audio)
-    await websocket.send_text(response_frame)
-
+    greeting_sent = False
     audio_buffer = AudioStreamBuffer(sample_rate=16000, silence_threshold_ms=600)
 
     try:
         while True:
             raw_msg = await websocket.receive_text()
             event_type, stream_sid, pcm_bytes = exotel_provider.parse_websocket_event(raw_msg)
+            active_stream_id = stream_sid or call_id
+
+            # Send greeting upon receiving 'start' event or first media frame
+            if not greeting_sent and (event_type in ["start", "connected"] or (event_type == "media" and active_stream_id)):
+                greeting_text = conv_manager.get_initial_greeting(session)
+                greeting_audio = await tts_provider.synthesize_speech(greeting_text)
+                response_frame = exotel_provider.format_media_response(active_stream_id, greeting_audio)
+                await websocket.send_text(response_frame)
+                greeting_sent = True
+                logger.info(f"[{call_id}] Initial greeting sent to stream {active_stream_id}.")
 
             if event_type == "media" and pcm_bytes:
                 # Buffer audio frames and wait for turn completion (silence detection)
