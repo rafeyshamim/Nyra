@@ -48,7 +48,14 @@ class ExotelAgentStreamProvider(TelephonyProvider):
         """Parse incoming Exotel WebSocket JSON message to (event_type, stream_sid, pcm_bytes)."""
         data = json.loads(raw_message)
         event_type = data.get("event", "")
-        stream_sid = data.get("stream_sid", "")
+        stream_sid = (
+            data.get("stream_sid")
+            or data.get("streamSid")
+            or data.get("sid")
+            or data.get("start", {}).get("streamSid")
+            or data.get("start", {}).get("stream_sid")
+            or ""
+        )
 
         pcm_bytes = b""
         if event_type == "media":
@@ -109,24 +116,68 @@ class ExotelAgentStreamProvider(TelephonyProvider):
     @staticmethod
     def _alaw_to_pcm16(alaw_samples) -> Any:
         import numpy as np
-        y = alaw_samples ^ 0x55
+        y = (alaw_samples ^ 0x55).astype(np.int32)
         sign = np.where((y & 0x80) != 0, -1, 1)
         exponent = (y & 0x70) >> 4
         mantissa = y & 0x0F
-        if (exponent == 0):
-            sample = (mantissa << 4) + 8
-        else:
-            sample = ((mantissa << 4) + 0x108) << (exponent - 1)
+        sample = np.where(
+            exponent == 0,
+            (mantissa << 4) + 8,
+            ((mantissa << 4) + 0x108) << np.maximum(0, exponent - 1)
+        )
         return np.clip(sign * sample, -32768, 32767).astype(np.int16)
 
-    def format_media_response(self, stream_sid: str, pcm_bytes: bytes) -> str:
-        """Format audio response payload into Exotel AgentStream WebSocket JSON frame."""
-        payload_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
+    def format_media_response(
+        self,
+        stream_sid: str,
+        audio_bytes: bytes,
+        target_encoding: str = "audio/pcm",
+        target_sample_rate: int = 16000,
+    ) -> str:
+        """Format audio response payload into Exotel AgentStream WebSocket JSON frame with encoding and sample_rate metadata."""
+        raw_pcm = self._extract_raw_pcm_and_resample(
+            audio_bytes=audio_bytes,
+            target_sample_rate=target_sample_rate,
+        )
+
+        payload_b64 = base64.b64encode(raw_pcm).decode("utf-8")
         msg = {
             "event": "media",
             "stream_sid": stream_sid,
             "media": {
                 "payload": payload_b64,
+                "encoding": target_encoding,
+                "sample_rate": target_sample_rate,
             },
         }
         return json.dumps(msg)
+
+    @staticmethod
+    def _extract_raw_pcm_and_resample(audio_bytes: bytes, target_sample_rate: int = 16000) -> bytes:
+        """Strip WAV header if present and resample 16-bit PCM to target_sample_rate."""
+        import io
+        import numpy as np
+        import soundfile as sf
+        from app.audio.resampler import resample_pcm16_bytes
+
+        if not audio_bytes:
+            return b""
+
+        pcm_bytes = audio_bytes
+        sample_rate = target_sample_rate
+
+        # Check for RIFF/WAV header
+        if audio_bytes.startswith(b"RIFF") and b"WAVE" in audio_bytes[:16]:
+            try:
+                buffer = io.BytesIO(audio_bytes)
+                data, sample_rate = sf.read(buffer, dtype="int16")
+                pcm_bytes = data.tobytes()
+            except Exception as e:
+                logger.warning(f"Failed to parse WAV header via soundfile ({e}), stripping standard 44-byte WAV header.")
+                if len(audio_bytes) > 44:
+                    pcm_bytes = audio_bytes[44:]
+
+        if sample_rate != target_sample_rate and len(pcm_bytes) > 0:
+            pcm_bytes = resample_pcm16_bytes(pcm_bytes, orig_sample_rate=sample_rate, target_sample_rate=target_sample_rate)
+
+        return pcm_bytes

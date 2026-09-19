@@ -62,10 +62,14 @@ def test_exotel_mulaw_codec_decoding_and_resampling():
 async def test_finalize_call_session_idempotency():
     from app.api.routes_telephony import finalize_call_session, active_calls
     from app.conversation.state import CallSession
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, MagicMock
 
     call_id = "test_dup_call_99"
     mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.first.return_value = None
+    mock_db.execute.return_value = mock_result
+
     mock_session = CallSession(call_id=call_id, phone_number="+919999999999")
 
     active_calls[call_id] = {
