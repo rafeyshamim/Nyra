@@ -58,6 +58,11 @@ async def test_post_call_processing_pipeline(async_session: AsyncSession):
     llm = OllamaLLMProvider()
     processor = PostCallProcessor(llm_provider=llm)
 
+    # Pre-create Call record in DB as done during /call/incoming
+    pre_call = Call(call_id="call_test_99", phone_number="+919876543210", status="ringing")
+    async_session.add(pre_call)
+    await async_session.commit()
+
     call_session = CallSession(call_id="call_test_99", phone_number="+919876543210")
     call_session.add_assistant_message("Hi, I'm Nyra, Rafey's AI assistant. How can I help you?")
     call_session.add_user_message("Hi, I am Rahul from XYZ Tech. I am calling to reschedule Rafey's interview to Friday.")

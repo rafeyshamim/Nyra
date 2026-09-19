@@ -47,26 +47,47 @@ class PostCallProcessor:
                 organization=analysis.organization,
             )
 
-        # 4. Save Call Record
-        call_record = Call(
-            call_id=call_session.call_id,
-            phone_number=call_session.phone_number,
-            contact_id=contact.id if contact else None,
-            started_at=datetime.datetime.fromtimestamp(call_session.start_time, datetime.timezone.utc),
-            ended_at=datetime.datetime.now(datetime.timezone.utc),
-            duration_seconds=call_session.duration_seconds,
-            status="completed",
-            language=call_session.detected_language,
-            intent=analysis.intent,
-            summary=analysis.summary,
-            requested_action=analysis.requested_action,
-            priority=analysis.urgency,
-            callback_requested=analysis.callback_requested,
-            callback_time=analysis.preferred_callback_time,
-            spam_score=analysis.spam_probability,
-            requires_attention=analysis.requires_human_attention,
-        )
-        session.add(call_record)
+        # 4. Save or Update Call Record
+        from sqlalchemy import select
+        res = await session.execute(select(Call).where(Call.call_id == call_session.call_id))
+        call_record = res.scalars().first()
+
+        if call_record:
+            call_record.phone_number = call_session.phone_number
+            call_record.contact_id = contact.id if contact else None
+            call_record.started_at = datetime.datetime.fromtimestamp(call_session.start_time, datetime.timezone.utc)
+            call_record.ended_at = datetime.datetime.now(datetime.timezone.utc)
+            call_record.duration_seconds = call_session.duration_seconds
+            call_record.status = "completed"
+            call_record.language = call_session.detected_language
+            call_record.intent = analysis.intent
+            call_record.summary = analysis.summary
+            call_record.requested_action = analysis.requested_action
+            call_record.priority = analysis.urgency
+            call_record.callback_requested = analysis.callback_requested
+            call_record.callback_time = analysis.preferred_callback_time
+            call_record.spam_score = analysis.spam_probability
+            call_record.requires_attention = analysis.requires_human_attention
+        else:
+            call_record = Call(
+                call_id=call_session.call_id,
+                phone_number=call_session.phone_number,
+                contact_id=contact.id if contact else None,
+                started_at=datetime.datetime.fromtimestamp(call_session.start_time, datetime.timezone.utc),
+                ended_at=datetime.datetime.now(datetime.timezone.utc),
+                duration_seconds=call_session.duration_seconds,
+                status="completed",
+                language=call_session.detected_language,
+                intent=analysis.intent,
+                summary=analysis.summary,
+                requested_action=analysis.requested_action,
+                priority=analysis.urgency,
+                callback_requested=analysis.callback_requested,
+                callback_time=analysis.preferred_callback_time,
+                spam_score=analysis.spam_probability,
+                requires_attention=analysis.requires_human_attention,
+            )
+            session.add(call_record)
         await session.flush()
 
         # 5. Save Transcript Messages
