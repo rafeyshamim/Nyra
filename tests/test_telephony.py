@@ -34,6 +34,62 @@ def test_exotel_provider_media_formatting():
     assert decoded_pcm == pcm_sample
 
 
+def test_exotel_mulaw_codec_decoding_and_resampling():
+    import json
+    import base64
+    provider = ExotelAgentStreamProvider()
+
+    # Generate 8kHz mu-law audio frame sample
+    mulaw_bytes = bytes([0x80, 0xFF, 0x00, 0x7F] * 20)
+    raw_msg = json.dumps({
+        "event": "media",
+        "stream_sid": "stream_mulaw_8k",
+        "media": {
+            "payload": base64.b64encode(mulaw_bytes).decode("utf-8"),
+            "encoding": "audio/mulaw",
+            "sample_rate": 8000
+        }
+    })
+
+    event, stream_sid, decoded_pcm = provider.parse_websocket_event(raw_msg)
+    assert event == "media"
+    assert stream_sid == "stream_mulaw_8k"
+    # 8kHz audio resampled to 16kHz produces twice as many 16-bit PCM samples
+    assert len(decoded_pcm) == len(mulaw_bytes) * 2 * 2
+
+
+@pytest.mark.asyncio
+async def test_finalize_call_session_idempotency():
+    from app.api.routes_telephony import finalize_call_session, active_calls
+    from app.conversation.state import CallSession
+    from unittest.mock import AsyncMock
+
+    call_id = "test_dup_call_99"
+    mock_db = AsyncMock()
+    mock_session = CallSession(call_id=call_id, phone_number="+919999999999")
+
+    active_calls[call_id] = {
+        "call_id": call_id,
+        "phone_number": "+919999999999",
+        "session": mock_session,
+        "processed": False
+    }
+
+    # First execution should process the call
+    with pytest.MonkeyPatch.context() as mp:
+        mock_process = AsyncMock()
+        from app.api import routes_telephony
+        mp.setattr(routes_telephony.postcall_processor, "process_completed_call", mock_process)
+
+        await finalize_call_session(call_id, mock_db)
+        assert mock_process.call_count == 1
+        assert active_calls[call_id]["processed"] is True
+
+        # Second execution should be a no-op
+        await finalize_call_session(call_id, mock_db)
+        assert mock_process.call_count == 1
+
+
 @pytest.mark.asyncio
 async def test_android_gateway_provider():
     provider = AndroidGatewayTelephonyProvider()
