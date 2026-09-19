@@ -17,10 +17,11 @@ class Settings(BaseSettings):
     owner_name: str = "Rafey"
 
     # Telephony Provider (android | exotel)
-    telephony_provider: str = "android"
+    telephony_provider: str = "exotel"
     exotel_account_sid: str = ""
     exotel_api_key: str = ""
     exotel_api_token: str = ""
+    exotel_virtual_number: str = ""
 
     # WhatsApp Provider (mock | cloud_api)
     whatsapp_provider: str = "mock"

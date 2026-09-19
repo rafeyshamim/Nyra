@@ -41,3 +41,44 @@ async def test_android_gateway_provider():
     assert res is True
     res_end = await provider.end_call("call_99")
     assert res_end is True
+
+
+def test_incoming_call_endpoint_json():
+    payload = {
+        "CallSid": "exotel_call_1001",
+        "From": "+919812345678",
+        "To": "+918000000000"
+    }
+    response = client.post("/call/incoming", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "accepted"
+    assert data["call_id"] == "exotel_call_1001"
+    assert data["phone_number"] == "+919812345678"
+    assert "websocket_url" in data
+    assert "ws/call/exotel_call_1001" in data["websocket_url"]
+
+
+def test_incoming_call_endpoint_xml():
+    payload = {
+        "CallSid": "exotel_call_1002",
+        "From": "+919812345679"
+    }
+    response = client.post("/call/incoming", json=payload, headers={"Accept": "application/xml"})
+    assert response.status_code == 200
+    assert "application/xml" in response.headers["content-type"]
+    assert "<Stream url=" in response.text
+    assert "ws/call/exotel_call_1002" in response.text
+
+
+def test_call_status_webhook():
+    status_payload = {
+        "CallSid": "exotel_call_1001",
+        "Status": "completed"
+    }
+    response = client.post("/call/status", json=status_payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "accepted"
+    assert data["call_id"] == "exotel_call_1001"
+    assert data["event"] == "completed"
