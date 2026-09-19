@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional
 from fastapi.responses import Response, JSONResponse
 from app.config.settings import settings
 from app.contacts.resolver import CallerResolver
+from app.conversation.state import CallSession
 
 logger = logging.getLogger("nyra.api.telephony")
 router = APIRouter(tags=["Telephony Webhooks & WebSockets"])
@@ -30,6 +31,25 @@ exotel_provider = ExotelAgentStreamProvider()
 
 # Registry of active call metadata indexed by call_id / CallSid
 active_calls: Dict[str, Dict[str, Any]] = {}
+
+
+async def finalize_call_session(call_id: str, db: AsyncSession, session: Optional[CallSession] = None):
+    """Ensure post-call processing is executed exactly once per call."""
+    call_entry = active_calls.get(call_id)
+    if call_entry:
+        if call_entry.get("processed"):
+            logger.info(f"Call {call_id} post-call analysis already processed. Skipping duplicate.")
+            return
+        call_entry["processed"] = True
+        session_to_process = call_entry.get("session") or session
+    else:
+        session_to_process = session
+
+    if session_to_process:
+        try:
+            await postcall_processor.process_completed_call(db, session_to_process)
+        except Exception as e:
+            logger.error(f"Post-call processing error for call {call_id}: {e}")
 
 
 async def parse_incoming_request(request: Request) -> Dict[str, Any]:
@@ -191,12 +211,7 @@ async def handle_telephony_event(request: Request, db: AsyncSession = Depends(ge
     elif event_type in ["call-end", "completed", "terminated", "finished"]:
         if call_entry:
             call_entry["status"] = "completed"
-            session = call_entry.get("session")
-            if session:
-                try:
-                    await postcall_processor.process_completed_call(db, session)
-                except Exception as e:
-                    logger.error(f"Error processing completed call {call_id}: {e}")
+        await finalize_call_session(call_id, db)
         logger.info(f"Call {call_id} ended.")
 
     elif event_type in ["failed-call", "failed", "busy", "no-answer", "canceled"]:
@@ -291,8 +306,5 @@ async def websocket_call_stream(
             except Exception as e:
                 logger.error(f"Error processing remaining speech buffer for call {call_id}: {e}")
 
-        # Finalize post-call analysis
-        try:
-            await postcall_processor.process_completed_call(db, session)
-        except Exception as e:
-            logger.error(f"Post-call processing error for call {call_id}: {e}")
+        # Finalize post-call analysis (idempotent)
+        await finalize_call_session(call_id, db, session)
