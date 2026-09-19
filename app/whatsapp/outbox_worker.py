@@ -36,7 +36,7 @@ class OutboxWorker:
 
             if success:
                 item.status = "sent"
-                item.sent_at = datetime.datetime.utcnow()
+                item.sent_at = datetime.datetime.now(datetime.timezone.utc)
                 processed_count += 1
             else:
                 item.retry_count += 1
