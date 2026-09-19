@@ -13,6 +13,13 @@ from app.audio.audio_buffer import AudioStreamBuffer
 from app.postcall.analyzer import PostCallProcessor
 from app.telephony.exotel import ExotelAgentStreamProvider
 
+from typing import Dict, Any, Optional
+from fastapi import HTTPException, status
+from fastapi.responses import Response, JSONResponse
+from app.config.settings import settings
+from app.contacts.resolver import CallerResolver
+from app.conversation.state import CallSession
+
 logger = logging.getLogger("nyra.api.telephony")
 router = APIRouter(tags=["Telephony Webhooks & WebSockets"])
 
@@ -23,13 +30,222 @@ tts_provider = KokoroTTSProvider(default_voice="female_warm")
 postcall_processor = PostCallProcessor(llm_provider=llm_provider)
 exotel_provider = ExotelAgentStreamProvider()
 
+# Registry of active call metadata indexed by call_id / CallSid
+active_calls: Dict[str, Dict[str, Any]] = {}
 
+
+async def finalize_call_session(call_id: str, db: AsyncSession, session: Optional[CallSession] = None):
+    """Ensure post-call processing is executed exactly once per call."""
+    call_entry = active_calls.get(call_id)
+    if call_entry:
+        if call_entry.get("processed"):
+            logger.info(f"Call {call_id} post-call analysis already processed. Skipping duplicate.")
+            return
+        call_entry["processed"] = True
+        session_to_process = call_entry.get("session") or session
+    else:
+        session_to_process = session
+
+    if session_to_process:
+        try:
+            await postcall_processor.process_completed_call(db, session_to_process)
+        except Exception as e:
+            logger.error(f"Post-call processing error for call {call_id}: {e}")
+
+
+def verify_webhook_auth(request: Request, data: Dict[str, Any]):
+    """Verify telephony webhook token if TELEPHONY_WEBHOOK_TOKEN setting is configured."""
+    expected_token = settings.telephony_webhook_token
+    if not expected_token:
+        return
+
+    auth_header = request.headers.get("x-webhook-token") or request.headers.get("authorization", "")
+    token_param = data.get("token") or data.get("webhook_token")
+
+    provided_token = ""
+    if auth_header:
+        provided_token = auth_header.replace("Bearer ", "").strip()
+    elif token_param:
+        provided_token = str(token_param).strip()
+
+    if provided_token != expected_token:
+        logger.warning(f"Unauthorized telephony webhook request from {request.client.host if request.client else 'unknown'}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing webhook verification token",
+        )
+
+
+async def parse_incoming_request(request: Request) -> Dict[str, Any]:
+    """Parse request parameters from JSON body, form data, or query params."""
+    data: Dict[str, Any] = {}
+
+    # Query params
+    if request.query_params:
+        data.update(dict(request.query_params))
+
+    # Content-type handling
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                data.update(body)
+        except Exception:
+            pass
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            data.update({k: str(v) for k, v in form.items()})
+        except Exception:
+            pass
+
+    return data
+
+
+def extract_call_id_and_number(data: Dict[str, Any]) -> tuple[str, str]:
+    """Extract call_id and caller phone number from parsed payload."""
+    call_id = (
+        data.get("CallSid")
+        or data.get("call_id")
+        or data.get("sid")
+        or data.get("uuid")
+        or f"call_{uuid.uuid4().hex[:10]}"
+    )
+
+    phone_number = (
+        data.get("From")
+        or data.get("Caller")
+        or data.get("phone_number")
+        or data.get("from_number")
+        or data.get("CallerNumber")
+        or ""
+    )
+
+    # Normalize phone number if missing leading +
+    if phone_number and not phone_number.startswith("+") and phone_number.isdigit():
+        if len(phone_number) == 10:
+            phone_number = f"+91{phone_number}"
+        elif len(phone_number) == 12 and phone_number.startswith("91"):
+            phone_number = f"+{phone_number}"
+
+    return call_id, phone_number
+
+
+@router.api_route("/call/incoming", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_db_session)):
+    """Callback route for incoming call events from Exotel / telephony providers."""
+    data = await parse_incoming_request(request)
+    verify_webhook_auth(request, data)
+    call_id, phone_number = extract_call_id_and_number(data)
+
+    logger.info(f"Incoming call callback received: call_id={call_id}, phone_number={phone_number}")
+
+    # Resolve caller context from contacts database
+    caller_ctx = await CallerResolver.resolve_caller_context(db, phone_number)
+    caller_name = caller_ctx.get("caller_name")
+
+    # Create Nyra conversation session
+    session = conv_manager.create_session(
+        call_id=call_id,
+        phone_number=phone_number,
+        caller_name=caller_name,
+    )
+
+    # Store call session in registry
+    active_calls[call_id] = {
+        "call_id": call_id,
+        "phone_number": phone_number,
+        "session": session,
+        "status": "ringing",
+        "caller_ctx": caller_ctx,
+    }
+
+    # Construct WebSocket URL for Exotel AgentStream connection
+    base_url = settings.public_base_url.rstrip("/")
+    if base_url.startswith("https://"):
+        ws_base = base_url.replace("https://", "wss://", 1)
+    elif base_url.startswith("http://"):
+        ws_base = base_url.replace("http://", "ws://", 1)
+    else:
+        ws_base = f"wss://{base_url}"
+
+    ws_url = f"{ws_base}/ws/call/{call_id}"
+
+    # Return Exotel XML connect instructions by default (or JSON if application/json requested)
+    accept_header = request.headers.get("accept", "").lower()
+    if "application/json" in accept_header:
+        return JSONResponse(
+            content={
+                "status": "accepted",
+                "call_id": call_id,
+                "phone_number": phone_number,
+                "websocket_url": ws_url,
+                "select": {
+                    "stream": {
+                        "url": ws_url
+                    }
+                },
+                "response": {
+                    "connect": {
+                        "stream": {
+                            "url": ws_url
+                        }
+                    }
+                }
+            }
+        )
+
+    xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_url}" />
+    </Connect>
+</Response>"""
+    return Response(content=xml_response, media_type="application/xml")
+
+
+@router.api_route("/call/status", methods=["GET", "POST"])
 @router.post("/webhooks/telephony")
-async def handle_telephony_event(request: Request):
-    """Webhook for incoming call events from telephony providers."""
-    data = await request.json()
-    logger.info(f"Incoming telephony event: {data}")
-    return {"status": "accepted"}
+async def handle_telephony_event(request: Request, db: AsyncSession = Depends(get_db_session)):
+    """Webhook for telephony status events (call-start, call-answer, call-end, failed-call)."""
+    data = await parse_incoming_request(request)
+    verify_webhook_auth(request, data)
+    call_id, phone_number = extract_call_id_and_number(data)
+    event_type = (
+        data.get("EventType")
+        or data.get("event")
+        or data.get("Status")
+        or data.get("CallStatus")
+        or "unknown"
+    ).lower()
+
+    logger.info(f"Telephony event received: call_id={call_id}, event={event_type}, data={data}")
+
+    call_entry = active_calls.get(call_id)
+
+    if event_type in ["call-start", "ringing"]:
+        if call_entry:
+            call_entry["status"] = "ringing"
+        logger.info(f"Call {call_id} is ringing.")
+
+    elif event_type in ["call-answer", "in-progress", "answered"]:
+        if call_entry:
+            call_entry["status"] = "in-progress"
+        logger.info(f"Call {call_id} answered.")
+
+    elif event_type in ["call-end", "completed", "terminated", "finished"]:
+        if call_entry:
+            call_entry["status"] = "completed"
+        await finalize_call_session(call_id, db)
+        logger.info(f"Call {call_id} ended.")
+
+    elif event_type in ["failed-call", "failed", "busy", "no-answer", "canceled"]:
+        if call_entry:
+            call_entry["status"] = "failed"
+        logger.info(f"Call {call_id} failed with event: {event_type}")
+
+    return {"status": "accepted", "call_id": call_id, "event": event_type}
 
 
 @router.websocket("/ws/call/{call_id}")
@@ -42,7 +258,29 @@ async def websocket_call_stream(
     await websocket.accept()
     logger.info(f"WebSocket connected for call_id={call_id}")
 
-    session = conv_manager.create_session(call_id=call_id, phone_number="+919876543210")
+    # Retrieve existing session from registry or create a new session
+    call_entry = active_calls.get(call_id)
+    if call_entry and call_entry.get("session"):
+        session = call_entry["session"]
+    else:
+        # Fallback to resolver if session was not pre-registered via /call/incoming
+        caller_number = (call_entry.get("phone_number") if call_entry else "") or "Unknown"
+        caller_ctx = await CallerResolver.resolve_caller_context(db, caller_number) if caller_number != "Unknown" else {}
+        session = conv_manager.create_session(
+            call_id=call_id,
+            phone_number=caller_number,
+            caller_name=caller_ctx.get("caller_name"),
+        )
+        active_calls[call_id] = {
+            "call_id": call_id,
+            "phone_number": caller_number,
+            "session": session,
+            "status": "in-progress",
+            "caller_ctx": caller_ctx,
+        }
+
+    if call_entry:
+        call_entry["status"] = "in-progress"
     greeting_text = conv_manager.get_initial_greeting(session)
 
     # Synthesize and send initial greeting speech
@@ -94,8 +332,5 @@ async def websocket_call_stream(
             except Exception as e:
                 logger.error(f"Error processing remaining speech buffer for call {call_id}: {e}")
 
-        # Finalize post-call analysis
-        try:
-            await postcall_processor.process_completed_call(db, session)
-        except Exception as e:
-            logger.error(f"Post-call processing error for call {call_id}: {e}")
+        # Finalize post-call analysis (idempotent)
+        await finalize_call_session(call_id, db, session)
