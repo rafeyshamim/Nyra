@@ -2,6 +2,7 @@ import logging
 import tempfile
 import io
 import os
+import asyncio
 from typing import Optional, Union, Tuple
 import numpy as np
 import soundfile as sf
@@ -61,12 +62,21 @@ class FasterWhisperSTTProvider(STTProvider):
         if not self.model:
             raise RuntimeError("faster-whisper model is not initialized.")
 
-        # Save bytes to a temporary file for CTranslate2 processing
+        # Convert raw PCM bytes (missing RIFF header) into valid WAV format
+        if not audio_bytes.startswith(b"RIFF"):
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+            buffer = io.BytesIO()
+            sf.write(buffer, audio_data, sample_rate, format="WAV", subtype="PCM_16")
+            wav_payload = buffer.getvalue()
+        else:
+            wav_payload = audio_bytes
+
+        # Save bytes to a temporary WAV file for CTranslate2 processing
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(audio_bytes)
+            tmp.write(wav_payload)
             tmp_path = tmp.name
 
-        try:
+        def _sync_transcribe() -> TranscriptionResult:
             segments, info = self.model.transcribe(
                 tmp_path,
                 language=language,
@@ -86,9 +96,15 @@ class FasterWhisperSTTProvider(STTProvider):
                 language=detected_lang,
                 confidence=confidence,
             )
+
+        try:
+            return await asyncio.to_thread(_sync_transcribe)
         finally:
             if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     def transcribe_numpy_array(
         self,

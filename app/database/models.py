@@ -1,4 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 from typing import Optional, List
 from sqlalchemy import (
     String,
@@ -27,8 +31,8 @@ class Contact(Base):
     relationship_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # friend, recruiter, client, etc.
     preferred_language: Mapped[str] = mapped_column(String(10), default="en")
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
 
     calls: Mapped[List["Call"]] = orm_relationship("Call", back_populates="contact")
 
@@ -41,7 +45,7 @@ class Call(Base):
     phone_number: Mapped[str] = mapped_column(String(30), index=True, nullable=False)
     contact_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("contacts.id"), nullable=True)
 
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="completed")
@@ -59,7 +63,7 @@ class Call(Base):
 
     recording_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     transcript_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
     contact: Mapped[Optional[Contact]] = orm_relationship("Contact", back_populates="calls")
     messages: Mapped[List["Message"]] = orm_relationship("Message", back_populates="call", cascade="all, delete-orphan")
@@ -72,7 +76,7 @@ class Message(Base):
     call_id: Mapped[str] = mapped_column(String(50), ForeignKey("calls.call_id"), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)  # system, user, assistant
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     language: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
 
     call: Mapped["Call"] = orm_relationship("Call", back_populates="messages")
@@ -89,7 +93,7 @@ class Task(Base):
     priority: Mapped[str] = mapped_column(String(20), default="medium")
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, completed, cancelled
     due_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
@@ -115,5 +119,5 @@ class OutboxNotification(Base):
     payload: Mapped[str] = mapped_column(Text, nullable=False)  # Formatted text / JSON payload
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, sent, failed
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

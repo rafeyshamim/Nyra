@@ -60,6 +60,15 @@ class AudioStreamBuffer:
 
         return completed_speech
 
+    def flush(self) -> Optional[bytes]:
+        """Flush any remaining accumulated speech audio."""
+        if self.speech_duration_ms >= self.min_speech_duration_ms and len(self.speech_buffer) > 0:
+            completed_speech = bytes(self.speech_buffer)
+            self.reset()
+            return completed_speech
+        self.reset()
+        return None
+
     def reset(self):
         """Reset current buffering state."""
         self.speech_buffer.clear()
