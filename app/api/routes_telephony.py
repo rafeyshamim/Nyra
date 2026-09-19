@@ -127,37 +127,37 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
 
     ws_url = f"{ws_base}/ws/call/{call_id}"
 
-    # Return Exotel XML or JSON connect instructions depending on Accept header or default
+    # Return Exotel XML connect instructions by default (or JSON if application/json requested)
     accept_header = request.headers.get("accept", "").lower()
-    if "xml" in accept_header:
-        xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+    if "application/json" in accept_header:
+        return JSONResponse(
+            content={
+                "status": "accepted",
+                "call_id": call_id,
+                "phone_number": phone_number,
+                "websocket_url": ws_url,
+                "select": {
+                    "stream": {
+                        "url": ws_url
+                    }
+                },
+                "response": {
+                    "connect": {
+                        "stream": {
+                            "url": ws_url
+                        }
+                    }
+                }
+            }
+        )
+
+    xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="{ws_url}" />
     </Connect>
 </Response>"""
-        return Response(content=xml_response, media_type="application/xml")
-
-    return JSONResponse(
-        content={
-            "status": "accepted",
-            "call_id": call_id,
-            "phone_number": phone_number,
-            "websocket_url": ws_url,
-            "select": {
-                "stream": {
-                    "url": ws_url
-                }
-            },
-            "response": {
-                "connect": {
-                    "stream": {
-                        "url": ws_url
-                    }
-                }
-            }
-        }
-    )
+    return Response(content=xml_response, media_type="application/xml")
 
 
 @router.api_route("/call/status", methods=["GET", "POST"])

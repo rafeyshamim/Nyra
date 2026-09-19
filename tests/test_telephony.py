@@ -49,7 +49,7 @@ def test_incoming_call_endpoint_json():
         "From": "+919812345678",
         "To": "+918000000000"
     }
-    response = client.post("/call/incoming", json=payload)
+    response = client.post("/call/incoming", json=payload, headers={"Accept": "application/json"})
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "accepted"
@@ -59,12 +59,12 @@ def test_incoming_call_endpoint_json():
     assert "ws/call/exotel_call_1001" in data["websocket_url"]
 
 
-def test_incoming_call_endpoint_xml():
+def test_incoming_call_endpoint_xml_default():
     payload = {
         "CallSid": "exotel_call_1002",
         "From": "+919812345679"
     }
-    response = client.post("/call/incoming", json=payload, headers={"Accept": "application/xml"})
+    response = client.post("/call/incoming", json=payload)
     assert response.status_code == 200
     assert "application/xml" in response.headers["content-type"]
     assert "<Stream url=" in response.text
