@@ -58,6 +58,29 @@ def test_exotel_mulaw_codec_decoding_and_resampling():
     assert len(decoded_pcm) == len(mulaw_bytes) * 2 * 2
 
 
+def test_exotel_outbound_mulaw_formatting():
+    import json
+    import base64
+    provider = ExotelAgentStreamProvider()
+
+    pcm_sample = b"\x00\x00\x01\x00" * 100
+    formatted = provider.format_media_response(
+        stream_sid="stream_out_mulaw",
+        audio_bytes=pcm_sample,
+        target_encoding="audio/mulaw",
+        target_sample_rate=8000,
+    )
+
+    data = json.loads(formatted)
+    assert data["event"] == "media"
+    assert data["stream_sid"] == "stream_out_mulaw"
+    assert data["media"]["encoding"] == "audio/mulaw"
+    assert data["media"]["sample_rate"] == 8000
+    assert "payload" in data["media"]
+    decoded_payload = base64.b64decode(data["media"]["payload"])
+    assert len(decoded_payload) > 0
+
+
 @pytest.mark.asyncio
 async def test_finalize_call_session_idempotency():
     from app.api.routes_telephony import finalize_call_session, active_calls
