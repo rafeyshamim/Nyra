@@ -118,6 +118,83 @@ async def test_finalize_call_session_idempotency():
 
 
 @pytest.mark.asyncio
+async def test_finalize_call_session_retry_on_failure():
+    from app.api.routes_telephony import finalize_call_session, active_calls
+    from app.conversation.state import CallSession
+    from unittest.mock import AsyncMock, MagicMock
+
+    call_id = "test_retry_call_100"
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.first.return_value = None
+    mock_db.execute.return_value = mock_result
+
+    mock_session = CallSession(call_id=call_id, phone_number="+919999999999")
+    active_calls[call_id] = {
+        "call_id": call_id,
+        "phone_number": "+919999999999",
+        "session": mock_session,
+        "processed": False
+    }
+
+    with pytest.MonkeyPatch.context() as mp:
+        from app.api import routes_telephony
+
+        # First attempt fails with exception
+        failing_mock = AsyncMock(side_effect=RuntimeError("LLM Provider Timeout"))
+        mp.setattr(routes_telephony.postcall_processor, "process_completed_call", failing_mock)
+
+        await finalize_call_session(call_id, mock_db)
+        assert active_calls[call_id]["processed"] is False
+        assert active_calls[call_id]["processing"] is False
+
+        # Retry attempt succeeds
+        success_mock = AsyncMock()
+        mp.setattr(routes_telephony.postcall_processor, "process_completed_call", success_mock)
+
+        await finalize_call_session(call_id, mock_db)
+        assert success_mock.call_count == 1
+        assert active_calls[call_id]["processed"] is True
+
+
+@pytest.mark.asyncio
+async def test_call_status_defers_finalization_when_ws_active():
+    from app.api.routes_telephony import handle_telephony_event, active_calls
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+
+    call_id = "test_race_ws_active"
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_rec = MagicMock()
+    mock_rec.status = "in-progress"
+    mock_result.scalars.return_value.first.return_value = mock_rec
+    mock_db.execute.return_value = mock_result
+
+    active_calls[call_id] = {
+        "call_id": call_id,
+        "phone_number": "+919999999999",
+        "ws_active": True,
+        "status": "in-progress",
+    }
+
+    req = MagicMock(spec=Request)
+    req.query_params = {}
+    req.headers = {"content-type": "application/json"}
+    req.json = AsyncMock(return_value={"CallSid": call_id, "Status": "completed"})
+
+    with pytest.MonkeyPatch.context() as mp:
+        from app.api import routes_telephony
+        mock_finalize = AsyncMock()
+        mp.setattr(routes_telephony, "finalize_call_session", mock_finalize)
+
+        res = await handle_telephony_event(req, mock_db)
+        assert res["status"] == "accepted"
+        # Finalization should be deferred, so mock_finalize should NOT be called
+        mock_finalize.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_android_gateway_provider():
     provider = AndroidGatewayTelephonyProvider()
     res = await provider.answer_call("call_99")

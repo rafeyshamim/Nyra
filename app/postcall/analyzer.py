@@ -90,14 +90,26 @@ class PostCallProcessor:
             session.add(call_record)
         await session.flush()
 
-        # 5. Save Transcript Messages
-        for msg in call_session.messages:
-            msg_record = Message(
-                call_id=call_session.call_id,
-                role=msg["role"],
-                content=msg["content"],
-            )
-            session.add(msg_record)
+        # 5. Save/Sync Transcript Messages
+        from sqlalchemy import select
+        existing_msgs_res = await session.execute(
+            select(Message).where(Message.call_id == call_session.call_id)
+        )
+        existing_msgs = existing_msgs_res.scalars().all() if hasattr(existing_msgs_res, "scalars") else []
+
+        # If call_session has no messages in memory (e.g. multi-worker recovery without session), sync from DB
+        if not call_session.messages and existing_msgs:
+            for m in existing_msgs:
+                call_session.messages.append({"role": m.role, "content": m.content})
+        elif call_session.messages and len(existing_msgs) < len(call_session.messages):
+            # If session has more messages than saved in DB, persist missing messages starting from len(existing_msgs)
+            for msg in call_session.messages[len(existing_msgs):]:
+                msg_record = Message(
+                    call_id=call_session.call_id,
+                    role=msg["role"],
+                    content=msg["content"],
+                )
+                session.add(msg_record)
 
         # 6. Create Task if Callback or Attention is Required
         if analysis.callback_requested or analysis.requires_human_attention:
