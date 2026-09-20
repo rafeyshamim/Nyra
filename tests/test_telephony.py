@@ -158,6 +158,47 @@ async def test_finalize_call_session_retry_on_failure():
 
 
 @pytest.mark.asyncio
+async def test_call_status_stale_call_recovery():
+    import datetime
+    from app.api.routes_telephony import handle_telephony_event, active_calls
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+
+    call_id = "test_stale_call_recovery"
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_rec = MagicMock()
+    mock_rec.status = "in-progress"
+    # Started 10 minutes ago
+    mock_rec.started_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)
+    mock_result.scalars.return_value.first.return_value = mock_rec
+    mock_db.execute.return_value = mock_result
+
+    # No local active WS (e.g. worker crashed)
+    active_calls[call_id] = {
+        "call_id": call_id,
+        "phone_number": "+919999999999",
+        "ws_active": False,
+        "status": "in-progress",
+    }
+
+    req = MagicMock(spec=Request)
+    req.query_params = {}
+    req.headers = {"content-type": "application/json"}
+    req.json = AsyncMock(return_value={"CallSid": call_id, "Status": "completed"})
+
+    with pytest.MonkeyPatch.context() as mp:
+        from app.api import routes_telephony
+        mock_finalize = AsyncMock()
+        mp.setattr(routes_telephony, "finalize_call_session", mock_finalize)
+
+        res = await handle_telephony_event(req, mock_db)
+        assert res["status"] == "accepted"
+        # Since call is >300s old, finalization recovery should be forced
+        mock_finalize.assert_called_once_with(call_id, mock_db)
+
+
+@pytest.mark.asyncio
 async def test_call_status_defers_finalization_when_ws_active():
     from app.api.routes_telephony import handle_telephony_event, active_calls
     from unittest.mock import AsyncMock, MagicMock

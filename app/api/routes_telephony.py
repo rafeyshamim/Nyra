@@ -20,6 +20,7 @@ from sqlalchemy import select
 from app.config.settings import settings
 from app.contacts.resolver import CallerResolver
 from app.conversation.state import CallSession
+import datetime
 from app.database.models import Call, Message
 
 logger = logging.getLogger("nyra.api.telephony")
@@ -300,7 +301,18 @@ async def handle_telephony_event(request: Request, db: AsyncSession = Depends(ge
         is_ws_active = call_entry.get("ws_active", False) if call_entry else False
         is_in_progress = (call_rec.status == "in-progress") if call_rec else False
 
-        if is_ws_active or is_in_progress:
+        # Stale call check: if in-progress but no local active WS and started > 300s ago (worker crashed)
+        is_stale = False
+        if is_in_progress and not is_ws_active and call_rec and call_rec.started_at:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            started_at = call_rec.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=datetime.timezone.utc)
+            if (now_utc - started_at).total_seconds() > 300:
+                is_stale = True
+                logger.warning(f"Call {call_id} detected as stale in-progress call (>300s old). Forcing finalization recovery.")
+
+        if is_ws_active or (is_in_progress and not is_stale):
             logger.info(f"WebSocket stream is active/in-progress for call {call_id}. Deferring finalization to WebSocket cleanup.")
         else:
             await finalize_call_session(call_id, db)
