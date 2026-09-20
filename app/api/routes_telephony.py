@@ -1,8 +1,12 @@
 import logging
 import uuid
 import json
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Request
+import datetime
+from typing import Dict, Any, Optional
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Request, HTTPException, status
+from fastapi.responses import Response, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.database.session import get_db_session
 from app.conversation.manager import ConversationManager
@@ -12,15 +16,10 @@ from app.tts.kokoro import KokoroTTSProvider
 from app.audio.audio_buffer import AudioStreamBuffer
 from app.postcall.analyzer import PostCallProcessor
 from app.telephony.exotel import ExotelAgentStreamProvider
-
-from typing import Dict, Any, Optional
-from fastapi import HTTPException, status
-from fastapi.responses import Response, JSONResponse
-from sqlalchemy import select
+from app.telephony.sip import SIPTelephonyProvider
 from app.config.settings import settings
 from app.contacts.resolver import CallerResolver
 from app.conversation.state import CallSession
-import datetime
 from app.database.models import Call, Message
 
 logger = logging.getLogger("nyra.api.telephony")
@@ -32,6 +31,7 @@ conv_manager = ConversationManager(llm_provider=llm_provider)
 tts_provider = KokoroTTSProvider(default_voice="female_warm")
 postcall_processor = PostCallProcessor(llm_provider=llm_provider)
 exotel_provider = ExotelAgentStreamProvider()
+sip_provider = SIPTelephonyProvider()
 
 # Registry of active call metadata indexed by call_id / CallSid
 active_calls: Dict[str, Dict[str, Any]] = {}
@@ -136,11 +136,9 @@ async def parse_incoming_request(request: Request) -> Dict[str, Any]:
     """Parse request parameters from JSON body, form data, or query params."""
     data: Dict[str, Any] = {}
 
-    # Query params
     if request.query_params:
         data.update(dict(request.query_params))
 
-    # Content-type handling
     content_type = request.headers.get("content-type", "").lower()
     if "application/json" in content_type:
         try:
@@ -178,7 +176,6 @@ def extract_call_id_and_number(data: Dict[str, Any]) -> tuple[str, str]:
         or ""
     )
 
-    # Normalize phone number if missing leading +
     if phone_number and not phone_number.startswith("+") and phone_number.isdigit():
         if len(phone_number) == 10:
             phone_number = f"+91{phone_number}"
@@ -186,6 +183,50 @@ def extract_call_id_and_number(data: Dict[str, Any]) -> tuple[str, str]:
             phone_number = f"+{phone_number}"
 
     return call_id, phone_number
+
+
+@router.api_route("/call/sip/event", methods=["POST"])
+async def handle_sip_call_event(request: Request, db: AsyncSession = Depends(get_db_session)):
+    """SIP event handler route for call lifecycle updates."""
+    data = await parse_incoming_request(request)
+    call_id, phone_number = extract_call_id_and_number(data)
+    event_type = data.get("event", "ringing").lower()
+
+    logger.info(f"SIP Call Event: call_id={call_id}, event={event_type}, phone={phone_number}")
+
+    if event_type in ["ringing", "invite"]:
+        caller_ctx = await CallerResolver.resolve_caller_context(db, phone_number)
+        session = conv_manager.create_session(
+            call_id=call_id,
+            phone_number=phone_number,
+            caller_name=caller_ctx.get("caller_name"),
+        )
+        active_calls[call_id] = {
+            "call_id": call_id,
+            "phone_number": phone_number,
+            "session": session,
+            "status": "ringing",
+            "caller_ctx": caller_ctx,
+            "provider": "sip",
+        }
+        await get_or_create_call_record(db, call_id, phone_number, status_str="ringing")
+
+    elif event_type in ["answered", "in-progress", "ack"]:
+        if call_id in active_calls:
+            active_calls[call_id]["status"] = "in-progress"
+        await get_or_create_call_record(db, call_id, phone_number, status_str="in-progress")
+
+    elif event_type in ["completed", "bye", "ended"]:
+        if call_id in active_calls:
+            active_calls[call_id]["status"] = "completed"
+        await finalize_call_session(call_id, db)
+
+    elif event_type in ["failed", "cancel", "stale"]:
+        if call_id in active_calls:
+            active_calls[call_id]["status"] = "failed"
+        await get_or_create_call_record(db, call_id, phone_number, status_str="failed")
+
+    return {"status": "accepted", "call_id": call_id, "event": event_type}
 
 
 @router.api_route("/call/incoming", methods=["GET", "POST"])
@@ -197,18 +238,15 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
 
     logger.info(f"Incoming call callback received: call_id={call_id}, phone_number={phone_number}")
 
-    # Resolve caller context from contacts database
     caller_ctx = await CallerResolver.resolve_caller_context(db, phone_number)
     caller_name = caller_ctx.get("caller_name")
 
-    # Create Nyra conversation session
     session = conv_manager.create_session(
         call_id=call_id,
         phone_number=phone_number,
         caller_name=caller_name,
     )
 
-    # Store call session in registry and SQLite DB
     active_calls[call_id] = {
         "call_id": call_id,
         "phone_number": phone_number,
@@ -218,7 +256,6 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
     }
     await get_or_create_call_record(db, call_id, phone_number, status_str="ringing")
 
-    # Construct WebSocket URL for Exotel AgentStream connection
     base_url = settings.public_base_url.rstrip("/")
     if base_url.startswith("https://"):
         ws_base = base_url.replace("https://", "wss://", 1)
@@ -229,7 +266,6 @@ async def handle_incoming_call(request: Request, db: AsyncSession = Depends(get_
 
     ws_url = f"{ws_base}/ws/call/{call_id}"
 
-    # Return Exotel XML connect instructions by default (or JSON if application/json requested)
     accept_header = request.headers.get("accept", "").lower()
     if "application/json" in accept_header:
         return JSONResponse(
@@ -301,7 +337,6 @@ async def handle_telephony_event(request: Request, db: AsyncSession = Depends(ge
         is_ws_active = call_entry.get("ws_active", False) if call_entry else False
         is_in_progress = (call_rec.status == "in-progress") if call_rec else False
 
-        # Stale call check: if in-progress but no local active WS and started > 300s ago (worker crashed)
         is_stale = False
         if is_in_progress and not is_ws_active and call_rec and call_rec.started_at:
             now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -336,12 +371,10 @@ async def websocket_call_stream(
     await websocket.accept()
     logger.info(f"WebSocket connected for call_id={call_id}")
 
-    # Retrieve existing session from registry or DB fallback
     call_entry = active_calls.get(call_id)
     if call_entry and call_entry.get("session"):
         session = call_entry["session"]
     else:
-        # Check DB for pre-registered call record
         res = await db.execute(select(Call).where(Call.call_id == call_id))
         call_rec = res.scalars().first() if hasattr(res, "scalars") else None
         caller_number = call_rec.phone_number if call_rec else "Unknown"
@@ -353,7 +386,6 @@ async def websocket_call_stream(
             caller_name=caller_ctx.get("caller_name"),
         )
 
-        # Load existing DB messages if present for multi-worker continuity
         res_msgs = await db.execute(select(Message).where(Message.call_id == call_id).order_by(Message.id.asc()))
         db_msgs = res_msgs.scalars().all() if hasattr(res_msgs, "scalars") else []
         for m in db_msgs:
@@ -385,7 +417,6 @@ async def websocket_call_stream(
             event_type, stream_sid, pcm_bytes = exotel_provider.parse_websocket_event(raw_msg)
             active_stream_id = stream_sid or call_id
 
-            # Send greeting upon receiving 'start' event or first media frame
             if not greeting_sent and (event_type in ["start", "connected"] or (event_type == "media" and active_stream_id)):
                 greeting_text = conv_manager.get_initial_greeting(session)
                 db.add(Message(call_id=call_id, role="assistant", content=greeting_text))
@@ -398,11 +429,9 @@ async def websocket_call_stream(
                 logger.info(f"[{call_id}] Initial greeting sent to stream {active_stream_id}.")
 
             if event_type == "media" and pcm_bytes:
-                # Buffer audio frames and wait for turn completion (silence detection)
                 completed_speech = audio_buffer.add_pcm_chunk(pcm_bytes)
 
                 if completed_speech:
-                    # Transcribe actual caller speech
                     transcription = await stt_provider.transcribe_audio_bytes(completed_speech)
                     user_text = transcription.text.strip()
 
@@ -410,7 +439,6 @@ async def websocket_call_stream(
                         logger.info(f"[{call_id}] Caller said: '{user_text}'")
                         nyra_response = await conv_manager.process_user_turn(session, user_text)
 
-                        # Persist turn messages to DB for multi-worker state durability
                         db.add(Message(call_id=call_id, role="user", content=user_text))
                         db.add(Message(call_id=call_id, role="assistant", content=nyra_response))
                         await db.commit()
@@ -430,7 +458,6 @@ async def websocket_call_stream(
     finally:
         call_entry["ws_active"] = False
 
-        # Flush any remaining speech buffer if call terminates mid-sentence
         remaining_speech = audio_buffer.flush()
         if remaining_speech:
             try:
@@ -444,5 +471,4 @@ async def websocket_call_stream(
             except Exception as e:
                 logger.error(f"Error processing remaining speech buffer for call {call_id}: {e}")
 
-        # Finalize post-call analysis (idempotent)
         await finalize_call_session(call_id, db, session)

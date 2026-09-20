@@ -4,6 +4,13 @@ import base64
 from typing import Dict, Any, Optional, Callable, Awaitable, Tuple
 from app.telephony.base import TelephonyProvider
 from app.config.settings import settings
+from app.audio.codecs import (
+    decode_audio_to_pcm16_16k,
+    encode_pcm16_16k_to_target,
+    mulaw_to_pcm16,
+    alaw_to_pcm16,
+    pcm16_to_mulaw,
+)
 
 logger = logging.getLogger("nyra.telephony.exotel")
 
@@ -66,66 +73,9 @@ class ExotelAgentStreamProvider(TelephonyProvider):
                 sample_rate = int(data.get("media", {}).get("sample_rate") or 16000)
 
                 # Decode audio format if non-PCM16 or non-16kHz
-                pcm_bytes = self._convert_to_pcm16_16k(raw_audio, encoding, sample_rate)
+                pcm_bytes = decode_audio_to_pcm16_16k(raw_audio, encoding, sample_rate)
 
         return event_type, stream_sid, pcm_bytes
-
-    def _convert_to_pcm16_16k(self, raw_audio: bytes, encoding: str, sample_rate: int) -> bytes:
-        """Convert raw audio payload (e.g., 8kHz / mulaw / pcm) to 16kHz 16-bit mono PCM bytes."""
-        import numpy as np
-        from app.audio.resampler import resample_pcm16_bytes
-
-        if not raw_audio:
-            return b""
-
-        # Decode mulaw / alaw to int16 PCM if needed
-        if "mulaw" in encoding or "ulaw" in encoding:
-            # μ-law decoding table or transformation
-            mulaw_samples = np.frombuffer(raw_audio, dtype=np.uint8)
-            # Expand mulaw to int16
-            pcm16_data = self._mulaw_to_pcm16(mulaw_samples)
-            pcm_bytes = pcm16_data.tobytes()
-        elif "alaw" in encoding:
-            alaw_samples = np.frombuffer(raw_audio, dtype=np.uint8)
-            pcm16_data = self._alaw_to_pcm16(alaw_samples)
-            pcm_bytes = pcm16_data.tobytes()
-        else:
-            pcm_bytes = raw_audio
-
-        # Resample to 16kHz if necessary
-        if sample_rate != 16000 and len(pcm_bytes) > 0:
-            pcm_bytes = resample_pcm16_bytes(pcm_bytes, orig_sample_rate=sample_rate, target_sample_rate=16000)
-
-        return pcm_bytes
-
-    @staticmethod
-    def _mulaw_to_pcm16(mulaw_samples) -> Any:
-        import numpy as np
-        mu = 255
-        y = mulaw_samples.astype(np.float32)
-        y = 0x80 - y
-        sign = np.sign(y)
-        y = np.abs(y)
-        exponent = (y.astype(np.int32) >> 4) & 0x07
-        mantissa = y.astype(np.int32) & 0x0F
-        sample = ((mantissa << 3) + 0x84) << exponent
-        sample = sample - 0x84
-        sample = sign * sample
-        return np.clip(sample, -32768, 32767).astype(np.int16)
-
-    @staticmethod
-    def _alaw_to_pcm16(alaw_samples) -> Any:
-        import numpy as np
-        y = (alaw_samples ^ 0x55).astype(np.int32)
-        sign = np.where((y & 0x80) != 0, -1, 1)
-        exponent = (y & 0x70) >> 4
-        mantissa = y & 0x0F
-        sample = np.where(
-            exponent == 0,
-            (mantissa << 4) + 8,
-            ((mantissa << 4) + 0x108) << np.maximum(0, exponent - 1)
-        )
-        return np.clip(sign * sample, -32768, 32767).astype(np.int16)
 
     def format_media_response(
         self,
@@ -134,19 +84,15 @@ class ExotelAgentStreamProvider(TelephonyProvider):
         target_encoding: Optional[str] = None,
         target_sample_rate: Optional[int] = None,
     ) -> str:
-        """Format audio response payload into Exotel AgentStream WebSocket JSON frame with encoding and sample_rate metadata."""
+        """Format audio response payload into Exotel AgentStream WebSocket JSON frame."""
         encoding = target_encoding or settings.exotel_media_encoding
         sample_rate = target_sample_rate or settings.exotel_media_sample_rate
 
-        raw_pcm = self._extract_raw_pcm_and_resample(
+        out_bytes = encode_pcm16_16k_to_target(
             audio_bytes=audio_bytes,
+            target_encoding=encoding,
             target_sample_rate=sample_rate,
         )
-
-        if "mulaw" in encoding.lower() or "ulaw" in encoding.lower():
-            out_bytes = self._pcm16_to_mulaw(raw_pcm)
-        else:
-            out_bytes = raw_pcm
 
         payload_b64 = base64.b64encode(out_bytes).decode("utf-8")
         msg = {
@@ -159,57 +105,3 @@ class ExotelAgentStreamProvider(TelephonyProvider):
             },
         }
         return json.dumps(msg)
-
-    @staticmethod
-    def _pcm16_to_mulaw(pcm_bytes: bytes) -> bytes:
-        """Convert 16-bit linear PCM raw bytes to G.711 mu-law bytes."""
-        import numpy as np
-
-        if not pcm_bytes:
-            return b""
-
-        pcm16_samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-        # Normalize int16 range to [-1, 1]
-        normalized = pcm16_samples / 32768.0
-        sign = np.sign(normalized)
-        abs_norm = np.abs(normalized)
-
-        # Mu-law compression formula: sgn(x) * ln(1 + mu*|x|) / ln(1 + mu)
-        mu = 255.0
-        compressed = sign * (np.log(1.0 + mu * abs_norm) / np.log(1.0 + mu))
-
-        # Map to uint8 mu-law quantization levels
-        quantized = ((compressed + 1.0) / 2.0 * 255.0).astype(np.uint8)
-        # Bitwise inversion standard in G.711 mu-law
-        mulaw_bytes = (quantized ^ 0xFF).tobytes()
-        return mulaw_bytes
-
-    @staticmethod
-    def _extract_raw_pcm_and_resample(audio_bytes: bytes, target_sample_rate: int = 16000) -> bytes:
-        """Strip WAV header if present and resample 16-bit PCM to target_sample_rate."""
-        import io
-        import numpy as np
-        import soundfile as sf
-        from app.audio.resampler import resample_pcm16_bytes
-
-        if not audio_bytes:
-            return b""
-
-        pcm_bytes = audio_bytes
-        sample_rate = target_sample_rate
-
-        # Check for RIFF/WAV header
-        if audio_bytes.startswith(b"RIFF") and b"WAVE" in audio_bytes[:16]:
-            try:
-                buffer = io.BytesIO(audio_bytes)
-                data, sample_rate = sf.read(buffer, dtype="int16")
-                pcm_bytes = data.tobytes()
-            except Exception as e:
-                logger.warning(f"Failed to parse WAV header via soundfile ({e}), stripping standard 44-byte WAV header.")
-                if len(audio_bytes) > 44:
-                    pcm_bytes = audio_bytes[44:]
-
-        if sample_rate != target_sample_rate and len(pcm_bytes) > 0:
-            pcm_bytes = resample_pcm16_bytes(pcm_bytes, orig_sample_rate=sample_rate, target_sample_rate=target_sample_rate)
-
-        return pcm_bytes
