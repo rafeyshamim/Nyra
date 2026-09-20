@@ -89,6 +89,10 @@ async def finalize_call_session(call_id: str, db: AsyncSession, session: Optiona
             phone_number=caller_number,
             caller_name=caller_ctx.get("caller_name"),
         )
+        res_msgs = await db.execute(select(Message).where(Message.call_id == call_id).order_by(Message.id.asc()))
+        db_msgs = res_msgs.scalars().all() if hasattr(res_msgs, "scalars") else []
+        for m in db_msgs:
+            session_to_process.messages.append({"role": m.role, "content": m.content})
         call_entry["session"] = session_to_process
 
     if session_to_process:
@@ -294,9 +298,10 @@ async def handle_telephony_event(request: Request, db: AsyncSession = Depends(ge
         call_rec = res.scalars().first() if hasattr(res, "scalars") else None
 
         is_ws_active = call_entry.get("ws_active", False) if call_entry else False
+        is_in_progress = (call_rec.status == "in-progress") if call_rec else False
 
-        if is_ws_active:
-            logger.info(f"WebSocket stream is active for call {call_id}. Deferring finalization to WebSocket cleanup.")
+        if is_ws_active or is_in_progress:
+            logger.info(f"WebSocket stream is active/in-progress for call {call_id}. Deferring finalization to WebSocket cleanup.")
         else:
             await finalize_call_session(call_id, db)
         logger.info(f"Call {call_id} ended.")
