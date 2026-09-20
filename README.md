@@ -349,8 +349,16 @@ DATABASE_URL=sqlite+aiosqlite:///./data/nyra.db
 NYRA_NAME=Nyra
 OWNER_NAME=Rafey
 
-# Telephony  (android | exotel)
-TELEPHONY_PROVIDER=android
+# Telephony  (sip | exotel | android)
+TELEPHONY_PROVIDER=sip
+SIP_SERVER_HOST=192.168.1.100
+SIP_SERVER_PORT=5060
+SIP_EXTENSION=1001
+SIP_PASSWORD=change_this_password
+SIP_MEDIA_ENCODING=audio/mulaw
+SIP_MEDIA_SAMPLE_RATE=8000
+
+# Optional PSTN Provider (Exotel)
 EXOTEL_ACCOUNT_SID=
 EXOTEL_API_KEY=
 EXOTEL_API_TOKEN=
@@ -507,14 +515,26 @@ python -m pytest tests/test_whatsapp.py -v
 
 ## Telephony Setup
 
-### Option 1 — Android SIP Gateway (Local, Free)
+### Option 1 — Local SIP PBX / Wi-Fi (Primary Free Development Setup)
 
-1. Install Linphone (https://www.linphone.org) or Zoiper (https://www.zoiper.com) on your Android phone.
-2. Configure a SIP account pointing to your PC local IP.
-3. Set `TELEPHONY_PROVIDER=android` in `.env`.
-4. Forward your carrier calls to the SIP number: `*21*SIPNumber#`
+Nyra uses local SIP telephony as its base provider at zero recurring cost.
 
-### Option 2 — Exotel Cloud Telephony (India)
+1. Install Asterisk or FreeSWITCH on your PC (or run a local SIP client like Linphone on your iPhone/Android).
+2. Connect both your phone and PC to the same Wi-Fi / LAN network.
+3. Register your phone's SIP client (e.g., Linphone) as extension `1001` on your local PBX.
+4. Set `TELEPHONY_PROVIDER=sip` in `.env`:
+   ```dotenv
+   TELEPHONY_PROVIDER=sip
+   SIP_SERVER_HOST=192.168.1.100
+   SIP_SERVER_PORT=5060
+   SIP_EXTENSION=1001
+   SIP_PASSWORD=change_this_password
+   SIP_MEDIA_ENCODING=audio/mulaw
+   SIP_MEDIA_SAMPLE_RATE=8000
+   ```
+5. Call Nyra's SIP extension directly over Wi-Fi.
+
+### Option 2 — Exotel Cloud Telephony / PSTN (Optional Paid Provider)
 
 1. Create an account at https://exotel.com and purchase a virtual number.
 2. In your Exotel App settings, set the **Answer URL** to your ngrok URL:

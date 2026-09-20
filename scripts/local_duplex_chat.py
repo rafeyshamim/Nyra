@@ -3,9 +3,10 @@ import time
 import sys
 import uuid
 import io
-import numpy as np
+import logging
 import soundfile as sf
 from pathlib import Path
+from sqlalchemy import select
 
 # Add root directory to path
 base_dir = Path(__file__).resolve().parent.parent
@@ -18,99 +19,178 @@ from app.stt.faster_whisper import FasterWhisperSTTProvider
 from app.llm.client import OllamaLLMProvider
 from app.conversation.manager import ConversationManager
 from app.tts.kokoro import KokoroTTSProvider
+from app.postcall.analyzer import PostCallProcessor
+from app.database.session import init_db, AsyncSessionLocal
+from app.database.models import Call, Message
 
 
-async def simulate_duplex_conversation():
+async def run_interactive_duplex_conversation():
     setup_logging()
+    await init_db()
+
+    # Configure dedicated log file for local duplex chat session stats
+    logs_dir = base_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(logs_dir / "local_duplex_chat.log", encoding="utf-8")
+    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
     print("=" * 60)
-    print("   [DUPLEX] NYRA - Local Full Voice Duplex & VAD Pipeline")
+    print("   [DUPLEX] NYRA - Interactive Real-Time Voice Chat & VAD Pipeline")
+    print("   (Type 'hangup', 'exit', or 'quit' to end call and view analysis)")
     print("=" * 60)
 
-    # Initialize components
+    logger.info("Starting local interactive duplex conversation session...")
+
+    # Initialize core Nyra providers
     stt = FasterWhisperSTTProvider(model_size="tiny", device="cpu", compute_type="int8")
     llm = OllamaLLMProvider()
     tts = KokoroTTSProvider(default_voice="female_warm")
     manager = ConversationManager(llm_provider=llm)
+    postcall_processor = PostCallProcessor(llm_provider=llm)
 
-    call_id = str(uuid.uuid4())[:8]
-    session = manager.create_session(call_id=call_id, phone_number="+919876543210")
+    call_id = f"local_call_{uuid.uuid4().hex[:8]}"
+    phone_number = "+919876543210"
+    session = manager.create_session(call_id=call_id, phone_number=phone_number)
+
+    # Persist call in database
+    async with AsyncSessionLocal() as db:
+        call_rec = Call(call_id=call_id, phone_number=phone_number, status="in-progress")
+        db.add(call_rec)
+        await db.commit()
 
     # 1. Initial Greeting
     greeting = manager.get_initial_greeting(session)
-    print(f"\nNyra Greeting: '{greeting}'")
+    print(f"\nNyra: '{greeting}'")
+    logger.info(f"[{call_id}] Nyra Greeting: '{greeting}'")
+
+    start_tts = time.time()
     greeting_audio = await tts.synthesize_speech(greeting, voice="female_warm")
-    print(f"[OK] Greeting Audio Synthesized ({len(greeting_audio)} bytes)")
+    tts_latency = (time.time() - start_tts) * 1000
+    print(f"[Stats] Initial Greeting TTS Latency: {tts_latency:.1f}ms ({len(greeting_audio)} bytes WAV)")
+    logger.info(f"[{call_id}] Greeting TTS Latency: {tts_latency:.1f}ms, Audio Size: {len(greeting_audio)} bytes")
 
-    # Initialize Audio Buffer for streaming audio VAD simulation
+    async with AsyncSessionLocal() as db:
+        db.add(Message(call_id=call_id, role="assistant", content=greeting))
+        await db.commit()
+
     audio_buffer = AudioStreamBuffer(sample_rate=16000, silence_threshold_ms=600)
+    turn_idx = 1
 
-    # Simulated User Speech Input
-    user_speech_phrases = [
-        "Hi Nyra, I am Rahul from XYZ Technologies. Is Rafey available?",
-        "Could you ask him to call me back about the Friday meeting?",
-    ]
+    try:
+        while True:
+            print("\n" + "-" * 60)
+            user_input = input(f"[Caller Turn {turn_idx}] Say something (or press Enter for sample prompt): ").strip()
 
-    for turn_idx, speech_text in enumerate(user_speech_phrases, start=1):
-        print("\n" + "-" * 60)
-        print(f"[Caller Turn {turn_idx}] Simulating audio stream for: '{speech_text}'")
+            if user_input.lower() in ["hangup", "exit", "quit", "bye"]:
+                print("\n[Call Ended] Caller hung up.")
+                logger.info(f"[{call_id}] Call hung up by user on turn {turn_idx}.")
+                break
 
-        # Generate audio payload for speech
-        speech_wav = await tts.synthesize_speech(speech_text, voice="female_warm")
+            if not user_input:
+                default_prompts = [
+                    "Hi Nyra, I am Rahul from XYZ Technologies. Is Rafey available?",
+                    "Could you ask him to call me back about the Friday meeting?",
+                    "My number is 9876543210. Thank you!",
+                ]
+                user_input = default_prompts[(turn_idx - 1) % len(default_prompts)]
+                print(f"[Simulated Speech Input]: '{user_input}'")
 
-        # Extract raw PCM 16-bit mono audio data from WAV bytes
-        data, sr = sf.read(io.BytesIO(speech_wav), dtype="int16")
+            logger.info(f"[{call_id}] Caller Turn {turn_idx} Input: '{user_input}'")
 
-        # Resample to 16kHz if needed
-        if sr != 16000:
-            from app.audio.resampler import resample_pcm16_bytes
-            pcm_data = resample_pcm16_bytes(data.tobytes(), sr, 16000)
-        else:
-            pcm_data = data.tobytes()
+            # Synthesize input speech & stream through VAD buffer
+            speech_wav = await tts.synthesize_speech(user_input, voice="female_warm")
+            data, sr = sf.read(io.BytesIO(speech_wav), dtype="int16")
 
-        # Stream audio in 30ms frames (960 bytes at 16kHz 16-bit)
-        frame_size_bytes = 960
-        turn_completed_audio = None
+            if sr != 16000:
+                from app.audio.resampler import resample_pcm16_bytes
+                pcm_data = resample_pcm16_bytes(data.tobytes(), sr, 16000)
+            else:
+                pcm_data = data.tobytes()
 
-        start_stream = time.time()
-        for i in range(0, len(pcm_data), frame_size_bytes):
-            chunk = pcm_data[i : i + frame_size_bytes]
-            res = audio_buffer.add_pcm_chunk(chunk)
-            if res:
-                turn_completed_audio = res
+            frame_size_bytes = 960  # 30ms @ 16kHz
+            turn_completed_audio = None
+            start_vad = time.time()
 
-        # Stream silence frames to trigger VAD end-of-turn boundary
-        silence_frame = bytes(frame_size_bytes)
-        while not turn_completed_audio:
-            res = audio_buffer.add_pcm_chunk(silence_frame)
-            if res:
-                turn_completed_audio = res
+            for i in range(0, len(pcm_data), frame_size_bytes):
+                chunk = pcm_data[i : i + frame_size_bytes]
+                res = audio_buffer.add_pcm_chunk(chunk)
+                if res:
+                    turn_completed_audio = res
 
-        vad_detection_time = (time.time() - start_stream) * 1000
-        print(f"[VAD] Turn boundary detected! Audio segment size: {len(turn_completed_audio)} bytes (VAD time: {vad_detection_time:.1f}ms)")
+            silence_frame = bytes(frame_size_bytes)
+            while not turn_completed_audio:
+                res = audio_buffer.add_pcm_chunk(silence_frame)
+                if res:
+                    turn_completed_audio = res
 
-        # 2. Transcribe Audio via STT
-        start_stt = time.time()
-        transcription = await stt.transcribe_audio_bytes(turn_completed_audio, sample_rate=16000)
-        stt_latency = (time.time() - start_stt) * 1000
-        user_text = transcription.text.strip() or speech_text
-        print(f"[STT] Transcribed Text: '{user_text}' (Lang: {transcription.language}, Latency: {stt_latency:.1f}ms)")
+            vad_latency = (time.time() - start_vad) * 1000
 
-        # 3. Process turn through Conversation Manager & LLM
-        start_turn = time.time()
-        response_text = await manager.process_user_turn(session, user_text)
-        llm_latency = (time.time() - start_turn) * 1000
-        print(f"[LLM] Nyra Response: '{response_text}' (LLM: {llm_latency:.1f}ms)")
+            # 2. Transcribe via STT
+            start_stt = time.time()
+            transcription = await stt.transcribe_audio_bytes(turn_completed_audio, sample_rate=16000)
+            stt_latency = (time.time() - start_stt) * 1000
+            transcribed_text = transcription.text.strip() or user_input
 
-        # 4. Synthesize Nyra Response Speech
-        start_tts = time.time()
-        response_audio = await tts.synthesize_speech(response_text, voice="female_warm")
-        tts_latency = (time.time() - start_tts) * 1000
-        print(f"[TTS] Response Audio Generated: {len(response_audio)} bytes (TTS: {tts_latency:.1f}ms)")
+            print(f"[STT] Transcribed: '{transcribed_text}' (Lang: {transcription.language}, Latency: {stt_latency:.1f}ms, VAD: {vad_latency:.1f}ms)")
+            logger.info(f"[{call_id}] STT Result: '{transcribed_text}' [Lang: {transcription.language}, STT Latency: {stt_latency:.1f}ms, VAD: {vad_latency:.1f}ms]")
 
-    print("\n" + "=" * 60)
-    print("[OK] Duplex Voice Conversation pipeline completed successfully!")
-    print("=" * 60)
+            # 3. Process Turn via Conversation Manager & Ollama LLM
+            start_llm = time.time()
+            nyra_response = await manager.process_user_turn(session, transcribed_text)
+            llm_latency = (time.time() - start_llm) * 1000
+
+            print(f"\nNyra: '{nyra_response}'")
+            logger.info(f"[{call_id}] Nyra LLM Response: '{nyra_response}' [LLM Latency: {llm_latency:.1f}ms]")
+
+            # 4. Synthesize Response Voice via Kokoro TTS
+            start_tts = time.time()
+            response_audio = await tts.synthesize_speech(nyra_response, voice="female_warm")
+            tts_latency = (time.time() - start_tts) * 1000
+            total_turn_time = vad_latency + stt_latency + llm_latency + tts_latency
+
+            print(f"[TTS] Generated audio: {len(response_audio)} bytes (TTS Latency: {tts_latency:.1f}ms, Round-Trip: {total_turn_time:.1f}ms)")
+            logger.info(f"[{call_id}] TTS Latency: {tts_latency:.1f}ms, Total Turn Round-Trip: {total_turn_time:.1f}ms")
+
+            # Persist turn in database
+            async with AsyncSessionLocal() as db:
+                db.add(Message(call_id=call_id, role="user", content=transcribed_text))
+                db.add(Message(call_id=call_id, role="assistant", content=nyra_response))
+                await db.commit()
+
+            turn_idx += 1
+
+    finally:
+        print("\n" + "=" * 60)
+        print("   [POST-CALL] Running Automated Post-Call Analysis...")
+        print("=" * 60)
+
+        async with AsyncSessionLocal() as db:
+            call_rec = (await db.execute(select(Call).where(Call.call_id == call_id))).scalars().first()
+            if call_rec:
+                call_rec.status = "completed"
+                await db.commit()
+
+            await postcall_processor.process_completed_call(db, session)
+
+            # Retrieve updated call record
+            updated_call = (await db.execute(select(Call).where(Call.call_id == call_id))).scalars().first()
+            if updated_call:
+                summary_msg = (
+                    f"\nCall Stats & Summary:\n"
+                    f"  Call ID:       {updated_call.call_id}\n"
+                    f"  Caller Name:   {updated_call.caller_name or 'Unknown'}\n"
+                    f"  Intent:        {updated_call.intent}\n"
+                    f"  Priority:      {updated_call.priority}\n"
+                    f"  Action Items:  {updated_call.action_items}\n"
+                    f"  Summary:       {updated_call.summary}\n"
+                )
+                print(summary_msg)
+                logger.info(f"[{call_id}] Post-Call Analysis Completed:\n{summary_msg}")
+
+        print("[OK] Interactive duplex chat session finished successfully!")
 
 
 if __name__ == "__main__":
-    asyncio.run(simulate_duplex_conversation())
+    asyncio.run(run_interactive_duplex_conversation())

@@ -16,8 +16,18 @@ class Settings(BaseSettings):
     nyra_name: str = "Nyra"
     owner_name: str = "Rafey"
 
-    # Telephony Provider (android | exotel)
-    telephony_provider: str = "exotel"
+    # Telephony Provider (sip | exotel | android)
+    telephony_provider: str = "sip"
+
+    # SIP Telephony Configuration
+    sip_server_host: str = "192.168.1.100"
+    sip_server_port: int = 5060
+    sip_extension: str = "1001"
+    sip_password: str = "change_this_password"
+    sip_media_encoding: str = "audio/mulaw"
+    sip_media_sample_rate: int = 8000
+
+    # Optional Exotel Configuration
     exotel_account_sid: str = ""
     exotel_api_key: str = ""
     exotel_api_token: str = ""
@@ -43,6 +53,31 @@ class Settings(BaseSettings):
     data_dir: Path = base_dir / "data"
     recordings_dir: Path = base_dir / "recordings"
     logs_dir: Path = base_dir / "logs"
+
+    # Upper case attribute accessors for backward/property compatibility
+    @property
+    def SIP_SERVER_HOST(self) -> str:
+        return self.sip_server_host
+
+    @property
+    def SIP_SERVER_PORT(self) -> int:
+        return self.sip_server_port
+
+    @property
+    def SIP_EXTENSION(self) -> str:
+        return self.sip_extension
+
+    @property
+    def SIP_PASSWORD(self) -> str:
+        return self.sip_password
+
+    @property
+    def SIP_MEDIA_ENCODING(self) -> str:
+        return self.sip_media_encoding
+
+    @property
+    def SIP_MEDIA_SAMPLE_RATE(self) -> int:
+        return self.sip_media_sample_rate
 
     model_config = SettingsConfigDict(
         env_file=".env",
