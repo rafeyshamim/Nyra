@@ -20,7 +20,7 @@ from sqlalchemy import select
 from app.config.settings import settings
 from app.contacts.resolver import CallerResolver
 from app.conversation.state import CallSession
-from app.database.models import Call
+from app.database.models import Call, Message
 
 logger = logging.getLogger("nyra.api.telephony")
 router = APIRouter(tags=["Telephony Webhooks & WebSockets"])
@@ -65,23 +65,47 @@ async def finalize_call_session(call_id: str, db: AsyncSession, session: Optiona
         return
 
     call_entry = active_calls.get(call_id)
-    if call_entry:
-        if call_entry.get("processed"):
-            logger.info(f"Call {call_id} post-call analysis already processed. Skipping duplicate.")
-            return
-        call_entry["processed"] = True
-        session_to_process = call_entry.get("session") or session
-    else:
-        session_to_process = session
+    if not call_entry:
+        call_entry = {"call_id": call_id, "processed": False, "processing": False}
+        active_calls[call_id] = call_entry
+
+    if call_entry.get("processed"):
+        logger.info(f"Call {call_id} post-call analysis already processed. Skipping duplicate.")
+        return
+
+    if call_entry.get("processing"):
+        logger.info(f"Call {call_id} post-call analysis currently in progress. Skipping concurrent attempt.")
+        return
+
+    call_entry["processing"] = True
+    session_to_process = call_entry.get("session") or session
+
+    if not session_to_process and call_rec:
+        # Multi-worker recovery: reconstruct session from DB
+        caller_number = call_rec.phone_number
+        caller_ctx = await CallerResolver.resolve_caller_context(db, caller_number) if caller_number else {}
+        session_to_process = conv_manager.create_session(
+            call_id=call_id,
+            phone_number=caller_number,
+            caller_name=caller_ctx.get("caller_name"),
+        )
+        res_msgs = await db.execute(select(Message).where(Message.call_id == call_id).order_by(Message.id.asc()))
+        db_msgs = res_msgs.scalars().all() if hasattr(res_msgs, "scalars") else []
+        for m in db_msgs:
+            session_to_process.messages.append({"role": m.role, "content": m.content})
+        call_entry["session"] = session_to_process
 
     if session_to_process:
         try:
             await postcall_processor.process_completed_call(db, session_to_process)
+            call_entry["processed"] = True
             if call_rec:
                 call_rec.status = "completed"
                 await db.commit()
         except Exception as e:
             logger.error(f"Post-call processing error for call {call_id}: {e}")
+        finally:
+            call_entry["processing"] = False
 
 
 def verify_webhook_auth(request: Request, data: Dict[str, Any]):
@@ -269,7 +293,17 @@ async def handle_telephony_event(request: Request, db: AsyncSession = Depends(ge
     elif event_type in ["call-end", "completed", "terminated", "finished"]:
         if call_entry:
             call_entry["status"] = "completed"
-        await finalize_call_session(call_id, db)
+
+        res = await db.execute(select(Call).where(Call.call_id == call_id))
+        call_rec = res.scalars().first() if hasattr(res, "scalars") else None
+
+        is_ws_active = call_entry.get("ws_active", False) if call_entry else False
+        is_in_progress = (call_rec.status == "in-progress") if call_rec else False
+
+        if is_ws_active or is_in_progress:
+            logger.info(f"WebSocket stream is active/in-progress for call {call_id}. Deferring finalization to WebSocket cleanup.")
+        else:
+            await finalize_call_session(call_id, db)
         logger.info(f"Call {call_id} ended.")
 
     elif event_type in ["failed-call", "failed", "busy", "no-answer", "canceled"]:
@@ -306,6 +340,13 @@ async def websocket_call_stream(
             phone_number=caller_number,
             caller_name=caller_ctx.get("caller_name"),
         )
+
+        # Load existing DB messages if present for multi-worker continuity
+        res_msgs = await db.execute(select(Message).where(Message.call_id == call_id).order_by(Message.id.asc()))
+        db_msgs = res_msgs.scalars().all() if hasattr(res_msgs, "scalars") else []
+        for m in db_msgs:
+            session.messages.append({"role": m.role, "content": m.content})
+
         active_calls[call_id] = {
             "call_id": call_id,
             "phone_number": caller_number,
@@ -313,13 +354,17 @@ async def websocket_call_stream(
             "status": "in-progress",
             "caller_ctx": caller_ctx,
         }
+        call_entry = active_calls[call_id]
+
+    call_entry["ws_active"] = True
+    call_entry["status"] = "in-progress"
 
     await get_or_create_call_record(db, call_id, session.phone_number, status_str="in-progress")
 
-    if call_entry:
-        call_entry["status"] = "in-progress"
-
     greeting_sent = False
+    if any(m.get("role") == "assistant" for m in session.messages):
+        greeting_sent = True
+
     audio_buffer = AudioStreamBuffer(sample_rate=16000, silence_threshold_ms=600)
 
     try:
@@ -331,6 +376,9 @@ async def websocket_call_stream(
             # Send greeting upon receiving 'start' event or first media frame
             if not greeting_sent and (event_type in ["start", "connected"] or (event_type == "media" and active_stream_id)):
                 greeting_text = conv_manager.get_initial_greeting(session)
+                db.add(Message(call_id=call_id, role="assistant", content=greeting_text))
+                await db.commit()
+
                 greeting_audio = await tts_provider.synthesize_speech(greeting_text)
                 response_frame = exotel_provider.format_media_response(active_stream_id, greeting_audio)
                 await websocket.send_text(response_frame)
@@ -350,6 +398,11 @@ async def websocket_call_stream(
                         logger.info(f"[{call_id}] Caller said: '{user_text}'")
                         nyra_response = await conv_manager.process_user_turn(session, user_text)
 
+                        # Persist turn messages to DB for multi-worker state durability
+                        db.add(Message(call_id=call_id, role="user", content=user_text))
+                        db.add(Message(call_id=call_id, role="assistant", content=nyra_response))
+                        await db.commit()
+
                         audio_response = await tts_provider.synthesize_speech(nyra_response)
                         out_frame = exotel_provider.format_media_response(stream_sid or call_id, audio_response)
                         await websocket.send_text(out_frame)
@@ -363,6 +416,8 @@ async def websocket_call_stream(
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for call_id={call_id}")
     finally:
+        call_entry["ws_active"] = False
+
         # Flush any remaining speech buffer if call terminates mid-sentence
         remaining_speech = audio_buffer.flush()
         if remaining_speech:
@@ -370,7 +425,10 @@ async def websocket_call_stream(
                 transcription = await stt_provider.transcribe_audio_bytes(remaining_speech)
                 user_text = transcription.text.strip()
                 if user_text:
-                    await conv_manager.process_user_turn(session, user_text)
+                    nyra_resp = await conv_manager.process_user_turn(session, user_text)
+                    db.add(Message(call_id=call_id, role="user", content=user_text))
+                    db.add(Message(call_id=call_id, role="assistant", content=nyra_resp))
+                    await db.commit()
             except Exception as e:
                 logger.error(f"Error processing remaining speech buffer for call {call_id}: {e}")
 

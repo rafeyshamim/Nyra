@@ -90,41 +90,74 @@ class PostCallProcessor:
             session.add(call_record)
         await session.flush()
 
-        # 5. Save Transcript Messages
-        for msg in call_session.messages:
-            msg_record = Message(
-                call_id=call_session.call_id,
-                role=msg["role"],
-                content=msg["content"],
-            )
-            session.add(msg_record)
+        # 5. Save/Sync Transcript Messages
+        from sqlalchemy import select
+        existing_msgs_res = await session.execute(
+            select(Message).where(Message.call_id == call_session.call_id)
+        )
+        existing_msgs = existing_msgs_res.scalars().all() if hasattr(existing_msgs_res, "scalars") else []
 
-        # 6. Create Task if Callback or Attention is Required
+        # If call_session has no messages in memory (e.g. multi-worker recovery without session), sync from DB
+        if not call_session.messages and existing_msgs:
+            for m in existing_msgs:
+                call_session.messages.append({"role": m.role, "content": m.content})
+        elif call_session.messages and len(existing_msgs) < len(call_session.messages):
+            # If session has more messages than saved in DB, persist missing messages starting from len(existing_msgs)
+            for msg in call_session.messages[len(existing_msgs):]:
+                msg_record = Message(
+                    call_id=call_session.call_id,
+                    role=msg["role"],
+                    content=msg["content"],
+                )
+                session.add(msg_record)
+
+        # 6. Create Task if Callback or Attention is Required (Idempotent)
         if analysis.callback_requested or analysis.requires_human_attention:
-            task_record = Task(
-                call_id=call_session.call_id,
-                type="callback" if analysis.callback_requested else "followup",
-                title=f"Call from {analysis.caller_name}: {analysis.intent}",
-                description=f"Action: {analysis.requested_action}\nSummary: {analysis.summary}",
-                priority=analysis.urgency,
-                status="pending",
+            existing_task_res = await session.execute(
+                select(Task).where(Task.call_id == call_session.call_id)
             )
-            session.add(task_record)
+            existing_task = existing_task_res.scalars().first() if hasattr(existing_task_res, "scalars") else None
+            if existing_task:
+                existing_task.type = "callback" if analysis.callback_requested else "followup"
+                existing_task.title = f"Call from {analysis.caller_name}: {analysis.intent}"
+                existing_task.description = f"Action: {analysis.requested_action}\nSummary: {analysis.summary}"
+                existing_task.priority = analysis.urgency
+            else:
+                task_record = Task(
+                    call_id=call_session.call_id,
+                    type="callback" if analysis.callback_requested else "followup",
+                    title=f"Call from {analysis.caller_name}: {analysis.intent}",
+                    description=f"Action: {analysis.requested_action}\nSummary: {analysis.summary}",
+                    priority=analysis.urgency,
+                    status="pending",
+                )
+                session.add(task_record)
 
-        # 7. Outbox Pattern: Format WhatsApp Summary & Save to Outbox Table
+        # 7. Outbox Pattern: Format WhatsApp Summary & Save to Outbox Table (Idempotent)
+        existing_outbox_res = await session.execute(
+            select(OutboxNotification).where(OutboxNotification.call_id == call_session.call_id)
+        )
+        existing_outbox = existing_outbox_res.scalars().first() if hasattr(existing_outbox_res, "scalars") else None
+
         formatted_summary = format_whatsapp_summary(
             analysis=analysis,
             phone_number=call_session.phone_number,
             duration_seconds=call_session.duration_seconds,
         )
 
-        outbox_entry = OutboxNotification(
-            call_id=call_session.call_id,
-            recipient=settings.whatsapp_recipient_number or call_session.phone_number,
-            payload=formatted_summary,
-            status="pending",
-        )
-        session.add(outbox_entry)
+        recipient_num = settings.whatsapp_recipient_number or call_session.phone_number
+
+        if existing_outbox:
+            existing_outbox.recipient = recipient_num
+            existing_outbox.payload = formatted_summary
+        else:
+            outbox_entry = OutboxNotification(
+                call_id=call_session.call_id,
+                recipient=recipient_num,
+                payload=formatted_summary,
+                status="pending",
+            )
+            session.add(outbox_entry)
 
         await session.commit()
         await session.refresh(call_record)
