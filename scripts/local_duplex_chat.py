@@ -5,6 +5,7 @@ import uuid
 import io
 import logging
 import soundfile as sf
+import numpy as np
 from pathlib import Path
 from sqlalchemy import select
 
@@ -24,6 +25,42 @@ from app.database.session import init_db, AsyncSessionLocal
 from app.database.models import Call, Message
 
 
+def record_microphone_turn(audio_buffer: AudioStreamBuffer, max_seconds: int = 30):
+    """Record one microphone turn until VAD detects the end of speech."""
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError("Microphone support requires sounddevice. Run: pip install sounddevice") from exc
+
+    frame_samples = 480  # 30 ms at 16 kHz
+    print("[Microphone] Listening... speak now, then pause when finished.")
+    with sd.InputStream(
+        samplerate=16000,
+        channels=1,
+        dtype="int16",
+        blocksize=frame_samples,
+    ) as stream:
+        for _ in range(int(max_seconds * 1000 / 30)):
+            frame, _ = stream.read(frame_samples)
+            completed_speech = audio_buffer.add_pcm_chunk(np.asarray(frame).tobytes())
+            if completed_speech:
+                return completed_speech
+
+    return audio_buffer.flush()
+
+
+def play_wav_audio(wav_bytes: bytes) -> None:
+    """Play WAV bytes through the default Windows audio output."""
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise RuntimeError("Speaker support requires sounddevice. Run: pip install sounddevice") from exc
+
+    audio_data, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    sd.play(audio_data, sample_rate)
+    sd.wait()
+
+
 async def run_interactive_duplex_conversation():
     setup_logging()
     await init_db()
@@ -38,7 +75,7 @@ async def run_interactive_duplex_conversation():
 
     print("=" * 60)
     print("   [DUPLEX] NYRA - Interactive Real-Time Voice Chat & VAD Pipeline")
-    print("   (Type 'hangup', 'exit', or 'quit' to end call and view analysis)")
+    print("   (Press Enter to speak, type text for text mode, or type 'exit' to end)")
     print("=" * 60)
 
     logger.info("Starting local interactive duplex conversation session...")
@@ -70,6 +107,11 @@ async def run_interactive_duplex_conversation():
     tts_latency = (time.time() - start_tts) * 1000
     print(f"[Stats] Initial Greeting TTS Latency: {tts_latency:.1f}ms ({len(greeting_audio)} bytes WAV)")
     logger.info(f"[{call_id}] Greeting TTS Latency: {tts_latency:.1f}ms, Audio Size: {len(greeting_audio)} bytes")
+    try:
+        await asyncio.to_thread(play_wav_audio, greeting_audio)
+    except Exception as exc:
+        print(f"[Audio Warning] Could not play greeting: {exc}")
+        print("The WAV file is still available in memory; continuing with text output.")
 
     async with AsyncSessionLocal() as db:
         db.add(Message(call_id=call_id, role="assistant", content=greeting))
@@ -81,7 +123,7 @@ async def run_interactive_duplex_conversation():
     try:
         while True:
             print("\n" + "-" * 60)
-            user_input = input(f"[Caller Turn {turn_idx}] Say something (or press Enter for sample prompt): ").strip()
+            user_input = input(f"[Caller Turn {turn_idx}] Press Enter to speak or type a message: ").strip()
 
             if user_input.lower() in ["hangup", "exit", "quit", "bye"]:
                 print("\n[Call Ended] Caller hung up.")
@@ -89,43 +131,42 @@ async def run_interactive_duplex_conversation():
                 break
 
             if not user_input:
-                default_prompts = [
-                    "Hi Nyra, I am Rahul from XYZ Technologies. Is Rafey available?",
-                    "Could you ask him to call me back about the Friday meeting?",
-                    "My number is 9876543210. Thank you!",
-                ]
-                user_input = default_prompts[(turn_idx - 1) % len(default_prompts)]
-                print(f"[Simulated Speech Input]: '{user_input}'")
-
-            logger.info(f"[{call_id}] Caller Turn {turn_idx} Input: '{user_input}'")
-
-            # Synthesize input speech & stream through VAD buffer
-            speech_wav = await tts.synthesize_speech(user_input, voice="female_warm")
-            data, sr = sf.read(io.BytesIO(speech_wav), dtype="int16")
-
-            if sr != 16000:
-                from app.audio.resampler import resample_pcm16_bytes
-                pcm_data = resample_pcm16_bytes(data.tobytes(), sr, 16000)
+                try:
+                    turn_completed_audio = await asyncio.to_thread(record_microphone_turn, audio_buffer)
+                except Exception as exc:
+                    print(f"[Audio Error] {exc}")
+                    print("Type a message instead, or install/check your microphone and speakers.")
+                    continue
+                if not turn_completed_audio:
+                    print("[Microphone] No speech detected. Try again.")
+                    continue
             else:
-                pcm_data = data.tobytes()
+                logger.info(f"[{call_id}] Caller Turn {turn_idx} Input: '{user_input}'")
 
-            frame_size_bytes = 960  # 30ms @ 16kHz
-            turn_completed_audio = None
-            start_vad = time.time()
+                # Preserve text mode by synthesizing the typed turn through the same audio pipeline.
+                speech_wav = await tts.synthesize_speech(user_input, voice="female_warm")
+                data, sr = sf.read(io.BytesIO(speech_wav), dtype="int16")
+                if sr != 16000:
+                    from app.audio.resampler import resample_pcm16_bytes
+                    pcm_data = resample_pcm16_bytes(data.tobytes(), sr, 16000)
+                else:
+                    pcm_data = data.tobytes()
 
-            for i in range(0, len(pcm_data), frame_size_bytes):
-                chunk = pcm_data[i : i + frame_size_bytes]
-                res = audio_buffer.add_pcm_chunk(chunk)
-                if res:
-                    turn_completed_audio = res
+                frame_size_bytes = 960
+                turn_completed_audio = None
+                start_vad = time.time()
+                for i in range(0, len(pcm_data), frame_size_bytes):
+                    res = audio_buffer.add_pcm_chunk(pcm_data[i : i + frame_size_bytes])
+                    if res:
+                        turn_completed_audio = res
+                while not turn_completed_audio:
+                    res = audio_buffer.add_pcm_chunk(bytes(frame_size_bytes))
+                    if res:
+                        turn_completed_audio = res
+                vad_latency = (time.time() - start_vad) * 1000
 
-            silence_frame = bytes(frame_size_bytes)
-            while not turn_completed_audio:
-                res = audio_buffer.add_pcm_chunk(silence_frame)
-                if res:
-                    turn_completed_audio = res
-
-            vad_latency = (time.time() - start_vad) * 1000
+            if not user_input:
+                vad_latency = 0.0
 
             # 2. Transcribe via STT
             start_stt = time.time()
@@ -152,6 +193,10 @@ async def run_interactive_duplex_conversation():
 
             print(f"[TTS] Generated audio: {len(response_audio)} bytes (TTS Latency: {tts_latency:.1f}ms, Round-Trip: {total_turn_time:.1f}ms)")
             logger.info(f"[{call_id}] TTS Latency: {tts_latency:.1f}ms, Total Turn Round-Trip: {total_turn_time:.1f}ms")
+            try:
+                await asyncio.to_thread(play_wav_audio, response_audio)
+            except Exception as exc:
+                print(f"[Audio Warning] Could not play response: {exc}")
 
             # Persist turn in database
             async with AsyncSessionLocal() as db:
@@ -180,10 +225,10 @@ async def run_interactive_duplex_conversation():
                 summary_msg = (
                     f"\nCall Stats & Summary:\n"
                     f"  Call ID:       {updated_call.call_id}\n"
-                    f"  Caller Name:   {updated_call.caller_name or 'Unknown'}\n"
-                    f"  Intent:        {updated_call.intent}\n"
-                    f"  Priority:      {updated_call.priority}\n"
-                    f"  Action Items:  {updated_call.action_items}\n"
+                    f"  Phone Number:   {updated_call.phone_number}\n"
+                    f"  Intent:         {updated_call.intent}\n"
+                    f"  Priority:       {updated_call.priority}\n"
+                    f"  Requested Action: {updated_call.requested_action}\n"
                     f"  Summary:       {updated_call.summary}\n"
                 )
                 print(summary_msg)
